@@ -1,0 +1,411 @@
+:root {
+  color: #1d2430;
+  background: #efe6d6;
+  font-family: "Public Sans", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  font-size: 16px;
+  line-height: 1.45;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  background: #0f5c56;
+  color: #fffaf3;
+  padding: 0.65rem 1rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+button.danger {
+  background: #8d3b2b;
+}
+
+h1,
+h2,
+h3,
+.brand strong {
+  font-family: Fraunces, "Songti SC", "Noto Serif SC", Georgia, serif;
+  font-weight: 560;
+  letter-spacing: -0.03em;
+}
+
+h1 {
+  margin: 0.2rem 0 0.6rem;
+  font-size: 3rem;
+}
+
+h2 {
+  margin: 0 0 0.8rem;
+  font-size: 1.5rem;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.language {
+  display: flex;
+  flex: none;
+  margin: 0;
+  padding: 0.15rem;
+  gap: 0.15rem;
+  border: 1px solid rgba(246, 241, 232, 0.4);
+  border-radius: 999px;
+  background: rgba(246, 241, 232, 0.08);
+}
+
+.language button {
+  flex: none;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #f6f1e8;
+  padding: 0.28rem 0.75rem;
+  font-size: 0.85rem;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.language button[aria-checked="true"] {
+  background: #f6f1e8;
+  color: #1d2430;
+  font-weight: 700;
+}
+
+.eyebrow {
+  margin: 0;
+  color: #8d3b2b;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.boot,
+.login-screen {
+  min-height: 100vh;
+}
+
+.login-screen {
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+  background:
+    radial-gradient(circle at top left, rgba(15, 92, 86, 0.16), transparent 28rem),
+    #efe6d6;
+}
+
+.login-card,
+.proposal,
+.reply,
+.ledger,
+.run,
+.message {
+  background: #fffaf3;
+  border: 1px solid #e4d8c6;
+  border-radius: 18px;
+}
+
+.login-card {
+  width: min(32rem, 100%);
+  padding: 2rem;
+  box-shadow: 0 24px 60px rgba(58, 42, 22, 0.08);
+}
+
+.lede,
+.hint,
+.status-line {
+  color: #5c6570;
+}
+
+label {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.8rem 0;
+  font-weight: 600;
+}
+
+input,
+textarea {
+  border: 1px solid #d9cbb8;
+  border-radius: 12px;
+  padding: 0.7rem 0.8rem;
+  background: white;
+  font: inherit;
+}
+
+.demo-accounts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 1rem;
+}
+
+.demo-accounts p {
+  width: 100%;
+  margin: 0;
+  color: #5c6570;
+}
+
+.demo-accounts button,
+.who button,
+.ticket-button {
+  background: transparent;
+  color: #1d2430;
+  border: 1px solid #d9cbb8;
+}
+
+.banner {
+  background: #f8e7e1;
+  color: #6d2c20;
+  border-radius: 12px;
+  padding: 0.7rem 0.8rem;
+}
+
+.desk {
+  min-height: 100vh;
+}
+
+header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.8rem 1rem;
+  align-items: center;
+  padding: 1rem 1.25rem;
+  background: #1d2430;
+  color: #f6f1e8;
+}
+
+.brand {
+  display: flex;
+  gap: 0.8rem;
+  align-items: center;
+}
+
+.who {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.mark {
+  display: grid;
+  width: 2.4rem;
+  height: 2.4rem;
+  place-items: center;
+  border-radius: 10px;
+  background: #e7c07b;
+  color: #1d2430;
+  font-family: Fraunces, "Songti SC", "Noto Serif SC", Georgia, serif;
+}
+
+.role {
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
+  background: #e7c07b;
+  color: #1d2430;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.who button {
+  color: #f6f1e8;
+  border-color: rgba(246, 241, 232, 0.35);
+}
+
+.who .language button {
+  color: #f6f1e8;
+  border-color: transparent;
+}
+
+.who .language button[aria-checked="true"] {
+  background: #f6f1e8;
+  color: #1d2430;
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: 18rem minmax(0, 1fr) 22rem;
+  gap: 1rem;
+  padding: 1rem;
+}
+
+.queue,
+.case,
+.decision,
+.empty {
+  min-height: calc(100vh - 6.5rem);
+}
+
+.queue,
+.empty {
+  padding: 0.2rem;
+}
+
+.ticket-button {
+  display: grid;
+  width: 100%;
+  margin-bottom: 0.55rem;
+  padding: 0.8rem;
+  border-radius: 14px;
+  text-align: left;
+  background: #fffaf3;
+}
+
+.ticket-button.selected {
+  border-color: #0f5c56;
+  box-shadow: inset 3px 0 0 #0f5c56;
+}
+
+.ticket-button small {
+  color: #5c6570;
+}
+
+.case,
+.decision {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.thread {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.message {
+  padding: 0.8rem 1rem;
+}
+
+.message span,
+.run li strong {
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.message p,
+.reply pre {
+  white-space: pre-wrap;
+  margin: 0.35rem 0 0;
+}
+
+.message-internal {
+  background: #f4efe4;
+}
+
+.proposal,
+.reply,
+.ledger,
+.run {
+  padding: 1rem;
+}
+
+.amount {
+  margin: 0;
+  font-family: Fraunces, "Songti SC", "Noto Serif SC", Georgia, serif;
+  font-size: 2.4rem;
+}
+
+.billing {
+  margin: 0.8rem 0;
+  padding: 0.75rem 0.85rem;
+  background: #f6f1e8;
+  border-radius: 12px;
+}
+
+.billing h3,
+.billing p {
+  margin: 0 0 0.35rem;
+}
+
+.billing ul {
+  margin: 0 0 0.55rem;
+  padding-left: 1.1rem;
+}
+
+textarea {
+  min-height: 5.5rem;
+  resize: vertical;
+}
+
+dl {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0.8rem 0;
+}
+
+dt {
+  color: #5c6570;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.run ul {
+  margin: 0.4rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.page-banner {
+  margin: 1rem 1rem 0;
+}
+
+@media (max-width: 980px) {
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .queue,
+  .case,
+  .decision,
+  .empty {
+    min-height: auto;
+  }
+}

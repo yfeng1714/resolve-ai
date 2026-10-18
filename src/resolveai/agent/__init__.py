@@ -1,0 +1,1 @@
+"""Bounded investigation graph."""

@@ -1,0 +1,21 @@
+name: resolveai
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg18-bookworm
+    environment:
+      POSTGRES_DB: resolveai_demo
+      POSTGRES_USER: resolveai_demo
+      POSTGRES_PASSWORD: resolveai_local_demo
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U resolveai_demo -d resolveai_demo"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  postgres_data:

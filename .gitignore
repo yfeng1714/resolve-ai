@@ -1,0 +1,51 @@
+# Local and private coordination files must never enter this public repository
+PROJECT_BRIEF.md
+WORKSPACE.md
+private/
+*_HANDOFF.md
+M0_AUDIT.md
+MANAGER_REVIEW.md
+
+# Secrets and local settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.aws/
+.codex/
+.DS_Store
+
+# Python
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+
+# Node and browsers
+node_modules/
+.pnpm-store/
+.npm-cache/
+.vite/
+.next/
+coverage/
+playwright-report/
+test-results/
+
+# Generated execution data; sanitized reports are explicitly curated
+eval/results/
+artifacts/
+logs/
+*.log
+*.sqlite*
+.pytest-db.lock
+.pytest-db.ready
+.pytest-db.pid

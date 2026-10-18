@@ -1,0 +1,41 @@
+[project]
+name = "resolveai"
+version = "0.0.0"
+description = "Agentic customer operations in a synthetic SaaS environment"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "alembic",
+  "fastapi",
+  "httpx",
+  "langgraph",
+  "pgvector",
+  "psycopg[binary]",
+  "pydantic",
+  "sqlalchemy",
+  "uvicorn",
+]
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio", "ruff"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["src", "."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "migrations"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["resolveai"]
+
+[tool.ruff.lint.per-file-ignores]
+"migrations/**/*.py" = ["E501"]

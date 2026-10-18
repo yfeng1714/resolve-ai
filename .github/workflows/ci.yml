@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg18-bookworm
+        env:
+          POSTGRES_DB: resolveai_demo
+          POSTGRES_USER: resolveai_demo
+          POSTGRES_PASSWORD: resolveai_local_demo
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U resolveai_demo -d resolveai_demo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RESOLVEAI_ENV: demo
+      DATABASE_URL: postgresql+psycopg://resolveai_demo:resolveai_local_demo@127.0.0.1:55432/resolveai_demo
+      API_DATABASE_URL: postgresql+psycopg://resolveai_api:resolveai_api_local@127.0.0.1:55432/resolveai_demo
+      SIMULATOR_DATABASE_URL: postgresql+psycopg://resolveai_simulator:resolveai_simulator_local@127.0.0.1:55432/resolveai_demo
+      ORACLE_DATABASE_URL: postgresql+psycopg://resolveai_oracle:resolveai_oracle_local@127.0.0.1:55432/resolveai_demo
+      SIMULATOR_BASE_URL: http://127.0.0.1:8001
+      SIMULATOR_TOKEN: resolveai_simulator_local_token
+      SIMULATOR_ALLOW_FAULTS: "0"
+      WEB_ORIGIN: http://127.0.0.1:5173
+      MODEL_PROVIDER: fake
+      LLM_BUDGET_USD: "0"
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Enable the pinned pnpm
+        run: corepack enable
+      - name: Install Python dependencies
+        run: uv sync --locked
+      - name: Lint and test the refund slice
+        run: uv run ruff check src tests migrations && uv run pytest
+      - name: Install the workbench
+        run: corepack pnpm install --frozen-lockfile
+      - name: Typecheck and build the workbench
+        run: corepack pnpm --dir apps/web build
+      - name: Install Chromium
+        working-directory: apps/web
+        run: corepack pnpm exec playwright install --with-deps chromium
+      - name: Browser acceptance
+        working-directory: apps/web
+        run: corepack pnpm test:e2e

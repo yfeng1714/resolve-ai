@@ -1,0 +1,12 @@
+{
+  "policy_version": "refund-policy-2026.10.12",
+  "currency": "USD",
+  "max_amount_cents": 10000,
+  "window_days": 7,
+  "requires": [
+    "duplicate_settled_payment",
+    "full_duplicate_amount_only",
+    "no_succeeded_or_pending_refund_for_event"
+  ],
+  "notes": "Deterministic refund eligibility for the synthetic demo. The model cannot waive these rules."
+}
