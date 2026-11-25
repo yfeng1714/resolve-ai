@@ -10,6 +10,7 @@ from resolveai.db.models import (
     Approval,
     Message,
     Proposal,
+    RecoveryJob,
     ReplyDraft,
     Run,
     Ticket,
@@ -24,6 +25,7 @@ def _iso(value: Any) -> str | None:
 
 
 def ticket_detail(session: Session, actor: Actor, ticket_id: UUID) -> dict[str, Any]:
+    session.flush()
     ticket = session.get(Ticket, ticket_id)
     if ticket is None or ticket.tenant_id != actor.tenant_id:
         raise APIError(404, "not_found", "Ticket was not found")
@@ -41,12 +43,20 @@ def ticket_detail(session: Session, actor: Actor, ticket_id: UUID) -> dict[str, 
         .order_by(Proposal.created_at, Proposal.revision)
     ).all()
     proposal_ids = [row.id for row in proposals]
-    approvals = []
+    approvals: list[Approval] = []
     if proposal_ids:
-        approvals = session.scalars(
-            select(Approval).where(Approval.proposal_id.in_(proposal_ids))
-        ).all()
-    approval_by_proposal = {row.proposal_id: row for row in approvals}
+        approvals = list(
+            session.scalars(
+                select(Approval)
+                .where(Approval.proposal_id.in_(proposal_ids))
+                .order_by(Approval.created_at, Approval.id)
+            ).all()
+        )
+    approval_by_proposal: dict[UUID, Approval] = {}
+    history_by_proposal: dict[UUID, list[Approval]] = {}
+    for row in approvals:
+        approval_by_proposal[row.proposal_id] = row
+        history_by_proposal.setdefault(row.proposal_id, []).append(row)
     replies = session.scalars(
         select(ReplyDraft)
         .where(ReplyDraft.ticket_id == ticket.id, ReplyDraft.tenant_id == actor.tenant_id)
@@ -119,18 +129,23 @@ def ticket_detail(session: Session, actor: Actor, ticket_id: UUID) -> dict[str, 
                 "currency": row.currency,
                 "payload_hash": row.payload_hash,
                 "policy_version": row.policy_version,
-                "target_payment_id": str(row.target_payment_id),
+                "target_payment_id": None
+                if row.target_payment_id is None
+                else str(row.target_payment_id),
                 "target_event_id": row.target_event_id,
+                "target_subscription_id": None
+                if row.target_subscription_id is None
+                else str(row.target_subscription_id),
+                "effective_at": None if row.effective_at is None else _iso(row.effective_at),
                 "preconditions": row.preconditions,
                 "evidence": row.evidence,
                 "created_at": _iso(row.created_at),
-                "approval": None
-                if approval_by_proposal.get(row.id) is None
-                else {
-                    "decision": approval_by_proposal[row.id].decision,
-                    "revision": approval_by_proposal[row.id].revision,
-                    "payload_hash": approval_by_proposal[row.id].payload_hash,
-                },
+                "approval": _approval_view(session, row, approval_by_proposal.get(row.id)),
+                "grant_history": [
+                    view
+                    for item in history_by_proposal.get(row.id, [])
+                    if (view := _approval_view(session, row, item)) is not None
+                ],
             }
             for row in proposals
         ],
@@ -148,6 +163,7 @@ def ticket_detail(session: Session, actor: Actor, ticket_id: UUID) -> dict[str, 
             }
             for row in actions
         ],
+        "recovery_jobs": _recovery_jobs(session, actor, runs),
         "replies": [
             {
                 "id": str(row.id),
@@ -162,6 +178,51 @@ def ticket_detail(session: Session, actor: Actor, ticket_id: UUID) -> dict[str, 
             }
             for row in replies
         ],
+        "incident": _incident_view(session, ticket),
+        "combined": _combined_view(session, ticket),
+    }
+
+
+def _recovery_jobs(session: Session, actor: Actor, runs: list[Run]) -> list[dict[str, Any]]:
+    if not runs:
+        return []
+    rows = session.scalars(
+        select(RecoveryJob)
+        .where(
+            RecoveryJob.tenant_id == actor.tenant_id,
+            RecoveryJob.run_id.in_([row.id for row in runs]),
+        )
+        .order_by(RecoveryJob.created_at)
+    ).all()
+    return [
+        {
+            "id": str(row.id),
+            "state": row.state,
+            "block_reason": row.block_reason,
+            "admitted": row.admitted_at is not None,
+            "command_generation": row.command_generation,
+            "proposal_id": str(row.proposal_id),
+        }
+        for row in rows
+    ]
+
+
+def _approval_view(
+    session: Session, proposal: Proposal, approval: Approval | None
+) -> dict[str, Any] | None:
+    if approval is None:
+        return None
+    from resolveai.services.grants import grant_label, revocation_for
+
+    revoked = revocation_for(session, approval.id)
+    return {
+        "id": str(approval.id),
+        "decision": approval.decision,
+        "revision": approval.revision,
+        "payload_hash": approval.payload_hash,
+        "label": grant_label(session, approval, proposal),
+        "expires_at": _iso(approval.expires_at),
+        "reason": None if revoked is None else revoked.reason,
     }
 
 
@@ -172,4 +233,78 @@ def ticket_summary(row: Ticket) -> dict[str, Any]:
         "status": row.status,
         "customer_label": row.customer_label,
         "updated_at": _iso(row.updated_at),
+    }
+
+
+def _combined_view(session: Session, ticket: Ticket) -> dict[str, Any]:
+    from resolveai.services.combined import current_halves, ticket_is_combined
+
+    active = ticket_is_combined(session, ticket)
+    halves = current_halves(session, ticket.id) if active else {}
+    return {
+        "active": active,
+        "halves": [
+            {
+                "half": half,
+                "outcome_code": row.outcome_code,
+                "reason_code": row.reason_code,
+                "action_id": row.action_id,
+                "outcome_id": str(row.id),
+            }
+            for half, row in halves.items()
+        ],
+    }
+
+
+def _incident_view(session: Session, ticket: Ticket) -> dict[str, Any]:
+    from resolveai.db.models import IncidentHandoff
+    from resolveai.domain.cancellation import canonical_instant
+    from resolveai.domain.incident import incident_requested
+    from resolveai.services.incident import current_incident_run, current_report
+
+    messages = session.scalars(
+        select(Message)
+        .where(
+            Message.ticket_id == ticket.id,
+            Message.author_kind.in_(("customer", "operator")),
+        )
+        .order_by(Message.revision)
+    ).all()
+    active = incident_requested([{"body": row.body} for row in messages])
+    report = current_report(session, ticket.id)
+    current_run = current_incident_run(session, ticket)
+    rows = session.scalars(
+        select(IncidentHandoff)
+        .where(IncidentHandoff.ticket_id == ticket.id)
+        .order_by(IncidentHandoff.created_at, IncidentHandoff.id)
+    ).all()
+    current = None
+    if current_run is not None:
+        current = next((row for row in rows if row.run_id == current_run.id), None)
+    return {
+        "active": active,
+        "report": None
+        if report is None
+        else {
+            "id": str(report.id),
+            "service_code": report.service_code,
+            "region_code": report.region_code,
+            "reported_started_at": canonical_instant(report.reported_started_at),
+            "request_id": report.request_id,
+            "input_revision": report.input_revision,
+        },
+        "handoff": None if current is None else _handoff_view(current),
+        "history": [_handoff_view(row) for row in rows if current is None or row.id != current.id],
+    }
+
+
+def _handoff_view(row: Any) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "run_id": str(row.run_id),
+        "kind": row.kind,
+        "reason_code": row.reason_code,
+        "incident_id": None if row.incident_id is None else str(row.incident_id),
+        "input_revision": row.input_revision,
+        "snapshot_digest": row.snapshot_digest,
     }

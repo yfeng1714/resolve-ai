@@ -199,6 +199,10 @@ def test_reinvestigation_after_a_sent_reply_does_not_open_a_second_refund(
     ).status_code == 200
     executed = client.post(f"/proposals/{proposal['id']}/execute", headers=approver, json=body)
     assert executed.status_code == 200, executed.text
+    from resolveai.worker.__main__ import drain
+
+    drain(settings)
+    executed = client.get(f"/tickets/{ticket_id}", headers=approver)
     reply = executed.json()["data"]["replies"][0]
     sent = client.post(
         f"/reply-drafts/{reply['id']}/approve-and-send",

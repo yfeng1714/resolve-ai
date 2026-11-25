@@ -7,11 +7,21 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from resolveai.clock import utcnow
-from resolveai.db.models import ActionLedger, Approval, Proposal, ReplyDraft, Run, Ticket
+from resolveai.db.models import (
+    ActionLedger,
+    Approval,
+    CombinedReply,
+    Proposal,
+    RecoveryJob,
+    ReplyDraft,
+    Run,
+    Ticket,
+)
 from resolveai.domain.hashing import canonical_hash, refund_payload
 from resolveai.domain.observations import parse_payments, parse_refunds
 from resolveai.domain.policy import evaluate_refund
 from resolveai.errors import APIError
+from resolveai.locale import phrase
 from resolveai.services.audit import audit
 from resolveai.services.input import latest_input_revision
 from resolveai.services.replies import append_message, new_receipt, render_reply, upsert_reply_draft
@@ -36,6 +46,11 @@ def _before_send_receipt() -> None:
     return None
 
 
+def _after_combined_ticket_lock() -> None:
+    """Test seam. The combined reply path holds the ticket lock and not the draft."""
+    return None
+
+
 def _before_dispatch() -> None:
     """Test seam. The reservation is committed and its locks are released."""
     return None
@@ -48,12 +63,33 @@ def approve_proposal(
     proposal_id: UUID,
     revision: int,
     payload_hash: str,
+    ttl_seconds: int,
 ) -> Proposal:
     _require_approver(actor)
     proposal, ticket, run = _proposal_context(session, actor.tenant_id, proposal_id)
     _require_exact(proposal, revision, payload_hash)
     _require_current_input(session, proposal, ticket, run)
+    from resolveai.services.grants import (
+        action_is_admitted,
+        current_grant,
+        grant_deadline,
+        latest_approval,
+        release_invalid_grant,
+    )
+
+    latest = latest_approval(session, proposal.tenant_id, proposal.id)
+    if latest is not None and current_grant(session, proposal) is None:
+        release_invalid_grant(
+            session, tenant_id=proposal.tenant_id, approval_id=latest.id, commit=False
+        )
+        session.refresh(proposal)
+    if current_grant(session, proposal) is not None:
+        raise APIError(409, "stale_proposal", "This proposal already has a valid grant")
+    if action_is_admitted(session, proposal):
+        session.commit()
+        raise APIError(409, "already_executed", "An admitted refund cannot be approved again")
     if proposal.status != "open":
+        session.commit()
         raise APIError(409, "stale_proposal", "Only an open proposal revision can be approved")
     proposal.status = "approved"
     session.add(
@@ -64,6 +100,7 @@ def approve_proposal(
             payload_hash=proposal.payload_hash,
             actor_user_id=actor.user_id,
             decision="approved",
+            expires_at=grant_deadline(session, ttl_seconds),
             created_at=utcnow(),
         )
     )
@@ -87,6 +124,7 @@ def reject_proposal(
     revision: int,
     payload_hash: str,
     tools: Any,
+    ttl_seconds: int,
 ) -> Proposal:
     del tools
     _require_approver(actor)
@@ -96,6 +134,8 @@ def reject_proposal(
     if proposal.status != "open":
         raise APIError(409, "stale_proposal", "Only an open proposal revision can be rejected")
     proposal.status = "rejected"
+    from resolveai.services.grants import grant_deadline
+
     session.add(
         Approval(
             tenant_id=proposal.tenant_id,
@@ -104,19 +144,42 @@ def reject_proposal(
             payload_hash=proposal.payload_hash,
             actor_user_id=actor.user_id,
             decision="rejected",
+            expires_at=grant_deadline(session, ttl_seconds),
             created_at=utcnow(),
         )
     )
-    body = render_reply(
-        kind="rejected",
-        ticket=ticket,
-        evidence=proposal.evidence,
-        amount_cents=proposal.amount_cents,
-        action_id=proposal.action_id,
-        operation_id=None,
-        payment_id=proposal.target_payment_id,
-        event_id=proposal.target_event_id,
+    body = (
+        phrase(
+            "reply_cancellation_rejected",
+            customer_name=ticket.customer_label,
+        )
+        if proposal.action_type == "cancel_at_period_end"
+        else render_reply(
+            kind="rejected",
+            ticket=ticket,
+            evidence=proposal.evidence,
+            amount_cents=proposal.amount_cents or 0,
+            action_id=proposal.action_id,
+            operation_id=None,
+            payment_id=proposal.target_payment_id or UUID(int=0),
+            event_id=proposal.target_event_id or "",
+        )
     )
+    from resolveai.services.combined import record_financial_state
+
+    if record_financial_state(
+        session, ticket, run, proposal, None, code="not_executed", reason="rejected"
+    ):
+        audit(
+            session,
+            tenant_id=actor.tenant_id,
+            event_type="proposal_rejected",
+            actor_user_id=actor.user_id,
+            ticket_id=ticket.id,
+            run_id=run.id,
+            payload={"proposal_id": str(proposal.id)},
+        )
+        return proposal
     upsert_reply_draft(session, ticket=ticket, run=run, body=body, actor_user_id=actor.user_id)
     run.state = "awaiting_reply_review"
     run.updated_at = utcnow()
@@ -143,6 +206,7 @@ def execute_proposal(
     payload_hash: str,
     tools: Any,
     fault: str | None = None,
+    model_name: str | None = None,
 ) -> ActionLedger:
     _require_approver(actor)
     proposal, ticket, run = _proposal_context(session, actor.tenant_id, proposal_id)
@@ -150,18 +214,33 @@ def execute_proposal(
     _require_current_input(session, proposal, ticket, run)
     if proposal.status == "superseded":
         raise APIError(409, "stale_proposal", "This proposal revision was superseded")
-    if proposal.status not in {"approved", "executed"}:
-        raise APIError(409, "not_approved", "Execution requires an approved revision")
-    approval = session.scalar(select(Approval).where(Approval.proposal_id == proposal.id))
-    if (
-        approval is None
-        or approval.decision != "approved"
-        or approval.revision != proposal.revision
-        or approval.payload_hash != proposal.payload_hash
-    ):
-        raise APIError(409, "not_approved", "Approval does not match this revision")
+    from resolveai.services.grants import (
+        current_grant,
+        invalid_grant_code,
+        latest_approval,
+        release_invalid_grant,
+    )
+
+    latest = latest_approval(session, actor.tenant_id, proposal.id)
+    if latest is not None and current_grant(session, proposal) is None:
+        release_invalid_grant(
+            session, tenant_id=actor.tenant_id, approval_id=latest.id, commit=False
+        )
+        session.refresh(proposal)
+    approval = current_grant(session, proposal)
     if str(ticket.account_id) != proposal.preconditions.get("account_id"):
         raise APIError(403, "denied", "Proposal account does not match the ticket")
+    if proposal.action_type == "cancel_at_period_end":
+        return _execute_cancellation(
+            session,
+            actor=actor,
+            proposal=proposal,
+            ticket=ticket,
+            run=run,
+            tools=tools,
+            model_name=model_name,
+            approval_ready=approval is not None and proposal.status in {"approved", "executed"},
+        )
 
     ledger = session.scalar(
         select(ActionLedger)
@@ -180,20 +259,17 @@ def execute_proposal(
     if ledger is not None and ledger.status == "confirmed":
         if ledger.proposal_id != proposal.id:
             raise APIError(409, "already_executed", "This payment already has an executed refund")
-        return _accept_verified(
-            session, actor, proposal, ticket, run, ledger, tools, recovered=False
+        return _reconfirm_or_keep(session, actor, proposal, ticket, run, ledger, tools)
+    if approval is None or proposal.status not in {"approved", "executed"}:
+        session.commit()
+        raise APIError(
+            409,
+            invalid_grant_code(session, proposal),
+            "This refund grant is no longer valid",
         )
-    if ledger is not None and (
-        ledger.status == "unknown" or ledger.dispatch_state == "dispatched"
-    ):
-        if ledger.proposal_id != proposal.id:
-            raise APIError(
-                409,
-                "stale_proposal",
-                "This action is already in progress for another proposal",
-            )
-        return _recover(session, actor, proposal, ticket, run, ledger, tools)
+    from resolveai.services.tenancy import require_bound_account
 
+    require_bound_account(session, ticket)
     if not _proposal_matches_live_state(tools, ticket, proposal):
         _reject_before_write(session, actor, proposal, ticket, run)
         raise APIError(
@@ -201,98 +277,222 @@ def execute_proposal(
             run.error_code or "stale_precondition",
             "Approved refund is no longer valid",
         )
+    from resolveai.services.recovery import enqueue_refund
 
-    if ledger is not None and ledger.status == "rejected":
-        if ledger.error_code not in DEFINITE_NO_WRITE:
-            raise APIError(409, ledger.error_code or "rejected", "This action was rejected")
-        looked = tools.get_operation(ticket.account_id, proposal.action_id)
-        if looked.status == "ok" and looked.data.get("status") == "confirmed":
-            return _accept_verified(
-                session, actor, proposal, ticket, run, ledger, tools, recovered=True
-            )
-        if looked.error_code != "not_found":
-            raise APIError(409, "unknown", "The previous attempt is still unresolved")
-        ledger.status = "pending"
-        ledger.dispatch_state = "reserved"
-        ledger.error_code = None
-        ledger.updated_at = utcnow()
-
-    if ledger is None:
-        now = utcnow()
-        ledger = ActionLedger(
-            tenant_id=actor.tenant_id,
-            action_id=proposal.action_id,
-            action_type="refund",
-            proposal_id=proposal.id,
-            reply_draft_id=None,
-            payload_hash=proposal.payload_hash,
-            status="pending",
-            dispatch_state="reserved",
-            operation_id=None,
-            result=None,
-            error_code=None,
-            created_at=now,
-            updated_at=now,
-        )
-        session.add(ledger)
-        session.flush()
-        audit(
-            session,
-            tenant_id=actor.tenant_id,
-            event_type="action_reserved",
-            actor_user_id=actor.user_id,
-            ticket_id=ticket.id,
-            run_id=run.id,
-            payload={"action_id": ledger.action_id},
-        )
-        session.commit()
-        _before_dispatch()
-
-    if ledger.dispatch_state == "reserved":
-        proposal, ticket, run, ledger = _commit_dispatch(
-            session, actor, proposal.id, ledger.action_id
-        )
-
-    result = tools.create_refund(
-        account_id=ticket.account_id,
-        payment_id=proposal.target_payment_id,
-        event_id=proposal.target_event_id,
-        amount_cents=proposal.amount_cents,
-        action_id=proposal.action_id,
-        payload_hash=proposal.payload_hash,
-        expected_payment_version=int(proposal.preconditions["payment_resource_version"]),
-        policy_version=proposal.policy_version,
-        fault=fault,
+    job = enqueue_refund(
+        session,
+        actor=actor,
+        proposal=proposal,
+        ticket=ticket,
+        run=run,
+        ledger=ledger,
+        test_fault=fault,
+        model_name=model_name,
     )
-    if result.status == "ok" and result.data.get("operation_status") == "confirmed":
-        run.state = "verifying"
-        run.updated_at = utcnow()
-        return _accept_verified(
-            session, actor, proposal, ticket, run, ledger, tools, recovered=False
+    session.commit()
+    _before_dispatch()
+    session.expire_all()
+    current_job = session.get(type(job), job.id)
+    current_proposal = session.get(type(proposal), proposal.id)
+    if current_job is None or current_proposal is None or current_job.state == "cancelled":
+        raise APIError(409, "stale_proposal", "New ticket input invalidated this proposal")
+    return session.get(ActionLedger, job.ledger_id) or ledger
+
+
+def _execute_cancellation(
+    session: Session,
+    *,
+    actor: Any,
+    proposal: Proposal,
+    ticket: Ticket,
+    run: Run,
+    tools: Any,
+    model_name: str | None,
+    approval_ready: bool,
+) -> ActionLedger:
+    from resolveai.domain.cancellation import canonical_instant
+    from resolveai.services.cancellation import subscription_views
+    from resolveai.services.grants import invalid_grant_code
+    from resolveai.services.recovery import enqueue_cancellation
+    from resolveai.services.tenancy import require_bound_account
+
+    require_bound_account(session, ticket)
+    ledger = session.scalar(
+        select(ActionLedger)
+        .where(
+            ActionLedger.tenant_id == actor.tenant_id,
+            ActionLedger.action_id == proposal.action_id,
         )
-    return _consume_write_result(session, actor, proposal, ticket, run, ledger, result, tools)
+        .with_for_update()
+    )
+    if ledger is not None and ledger.status == "confirmed":
+        return ledger
+    if not approval_ready:
+        session.commit()
+        raise APIError(
+            409,
+            invalid_grant_code(session, proposal),
+            "This cancellation grant is no longer valid",
+        )
+    read = tools.list_subscriptions(ticket.account_id)
+    if read.status != "ok":
+        raise APIError(503, "unavailable", "Subscriptions could not be read", retryable=True)
+    viewed = next(
+        (
+            row
+            for row in subscription_views(read.data)
+            if row.id == str(proposal.target_subscription_id)
+        ),
+        None,
+    )
+    expected = proposal.preconditions.get("effective_at")
+    version = proposal.preconditions.get("subscription_resource_version")
+    if (
+        viewed is None
+        or viewed.resource_version != version
+        or viewed.current_period_end != expected
+    ):
+        raise APIError(409, "version_conflict", "The subscription changed before scheduling")
+    if viewed.current_period_end <= canonical_instant(utcnow()):
+        raise APIError(409, "period_elapsed", "The period can no longer be scheduled")
+    if viewed.cancel_at_period_end:
+        raise APIError(409, "already_scheduled", "Cancellation is already scheduled")
+    effect = str(proposal.preconditions.get("effect_hash") or "")
+    if ledger is not None and ledger.payload_hash != effect:
+        raise APIError(409, "payload_conflict", "This period was reserved with a different effect")
+    if ledger is not None and ledger.status == "confirmed":
+        return ledger
+    job = enqueue_cancellation(
+        session,
+        actor=actor,
+        proposal=proposal,
+        ticket=ticket,
+        run=run,
+        ledger=ledger,
+        model_name=model_name,
+    )
+    session.commit()
+    found = session.get(ActionLedger, job.ledger_id)
+    if found is None:
+        raise APIError(503, "unavailable", "The cancellation reservation could not be reloaded")
+    return found
 
 
 def reconcile_action(session: Session, *, actor: Any, action_id: str, tools: Any) -> ActionLedger:
+    """Manual read of an action. Worker-owned refunds keep the worker's transaction.
+
+    Identifiers are read without locks, then ticket, proposal, run, ledger and
+    job are locked in that order so this cannot deadlock a worker fence.
+    """
     _require_approver(actor)
-    ledger = session.scalar(
-        select(ActionLedger)
-        .where(ActionLedger.tenant_id == actor.tenant_id, ActionLedger.action_id == action_id)
+    identified = session.execute(
+        select(ActionLedger.id, ActionLedger.proposal_id).where(
+            ActionLedger.tenant_id == actor.tenant_id,
+            ActionLedger.action_id == action_id,
+        )
+    ).one_or_none()
+    if identified is None or identified.proposal_id is None:
+        raise APIError(404, "not_found", "Action was not found")
+    ledger_id, proposal_id = identified
+    located = session.execute(
+        select(Proposal.ticket_id, Proposal.run_id).where(
+            Proposal.id == proposal_id,
+            Proposal.tenant_id == actor.tenant_id,
+        )
+    ).one_or_none()
+    if located is None:
+        raise APIError(404, "not_found", "Action was not found")
+    ticket_id, run_id = located
+    ticket = session.scalar(
+        select(Ticket)
+        .where(Ticket.id == ticket_id, Ticket.tenant_id == actor.tenant_id)
         .with_for_update()
     )
-    if ledger is None or ledger.proposal_id is None:
-        raise APIError(404, "not_found", "Action was not found")
-    proposal = session.get(Proposal, ledger.proposal_id)
-    if proposal is None or proposal.tenant_id != actor.tenant_id:
-        raise APIError(404, "not_found", "Action was not found")
-    ticket, run = _ticket_and_run(session, proposal)
-    if ledger.status == "confirmed":
-        return _accept_verified(
-            session, actor, proposal, ticket, run, ledger, tools, recovered=False
-        )
-    return _accept_verified(
-        session, actor, proposal, ticket, run, ledger, tools, recovered=True
+    proposal = session.scalar(
+        select(Proposal)
+        .where(Proposal.id == proposal_id, Proposal.tenant_id == actor.tenant_id)
+        .with_for_update()
     )
+    run = session.scalar(
+        select(Run).where(Run.id == run_id, Run.tenant_id == actor.tenant_id).with_for_update()
+    )
+    ledger = session.scalar(
+        select(ActionLedger)
+        .where(ActionLedger.id == ledger_id, ActionLedger.tenant_id == actor.tenant_id)
+        .with_for_update()
+    )
+    if ticket is None or proposal is None or run is None or ledger is None:
+        raise APIError(404, "not_found", "Action was not found")
+    job = session.scalar(
+        select(RecoveryJob)
+        .where(RecoveryJob.ledger_id == ledger.id, RecoveryJob.tenant_id == actor.tenant_id)
+        .order_by(RecoveryJob.created_at.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    for row in (ticket, proposal, run, ledger, job):
+        if row is not None:
+            session.refresh(row)
+    if job is not None and ledger.status != "confirmed":
+        raise APIError(409, "stale_proposal", "The recovery worker owns this action")
+    if ledger.status == "confirmed":
+        return _reconfirm_or_keep(session, actor, proposal, ticket, run, ledger, tools)
+    return _accept_verified(session, actor, proposal, ticket, run, ledger, tools, recovered=True)
+
+
+def _reply_was_sent(session: Session, ticket_id: UUID) -> bool:
+    sent = session.scalar(
+        select(ReplyDraft.id)
+        .where(ReplyDraft.ticket_id == ticket_id, ReplyDraft.status == "sent")
+        .limit(1)
+    )
+    return sent is not None
+
+
+def _reconfirm_or_keep(
+    session: Session,
+    actor: Any,
+    proposal: Proposal,
+    ticket: Ticket,
+    run: Run,
+    ledger: ActionLedger,
+    tools: Any,
+) -> ActionLedger:
+    """Keep a stored confirmation when a later read is unavailable or a reply was sent."""
+    if _reply_was_sent(session, ticket.id):
+        return ledger
+    from resolveai.services.tenancy import require_bound_account
+
+    require_bound_account(session, ticket)
+    if proposal.action_type == "cancel_at_period_end":
+        kind, _receipt = _verified_cancellation(tools, ticket, proposal)
+        if kind in {"conflict", "missing"}:
+            raise APIError(
+                409,
+                "inconsistent_recovery",
+                "The confirmed cancellation does not match the simulator",
+            )
+        return ledger
+    kind, receipt = _verified_receipt(tools, ticket, proposal)
+    if kind == "ok" and receipt is not None:
+        return _accept_verified(
+            session,
+            actor,
+            proposal,
+            ticket,
+            run,
+            ledger,
+            tools,
+            recovered=False,
+            prepared=(kind, receipt),
+        )
+    if kind == "conflict":
+        raise APIError(
+            409,
+            "inconsistent_recovery",
+            "The confirmed refund does not match the simulator",
+        )
+    return ledger
 
 
 def send_reply(
@@ -304,16 +504,32 @@ def send_reply(
     body_hash_value: str,
 ) -> ReplyDraft:
     _require_approver(actor)
-    draft = session.scalar(
-        select(ReplyDraft)
-        .where(ReplyDraft.id == reply_id, ReplyDraft.tenant_id == actor.tenant_id)
-        .with_for_update()
+    from resolveai.services.combined import (
+        combined_reply_for,
+        lock_current_halves,
+        reply_matches_current,
     )
+    from resolveai.services.incident import lock_incident_reply
+
+    located = session.execute(
+        select(ReplyDraft.ticket_id, CombinedReply.id)
+        .outerjoin(CombinedReply, CombinedReply.reply_draft_id == ReplyDraft.id)
+        .where(ReplyDraft.id == reply_id, ReplyDraft.tenant_id == actor.tenant_id)
+    ).one_or_none()
+    if located is not None and located[1] is not None:
+        ticket = _lock_ticket(session, actor.tenant_id, located[0])
+        _after_combined_ticket_lock()
+        lock_current_halves(session, ticket)
+    else:
+        lock_incident_reply(session, reply_id, sending=True)
+        ticket = None
+    draft = _locked_reply(session, actor.tenant_id, reply_id)
     if draft is None:
         raise APIError(404, "not_found", "Reply draft was not found")
     if draft.revision != revision or draft.body_hash != body_hash_value:
         raise APIError(409, "stale_proposal", "Reply revision does not match")
-    ticket = _ticket(session, actor.tenant_id, draft.ticket_id)
+    if ticket is None:
+        ticket = _ticket(session, actor.tenant_id, draft.ticket_id)
     run = session.get(Run, draft.run_id)
     if run is None:
         raise APIError(404, "not_found", "Run was not found")
@@ -329,6 +545,9 @@ def send_reply(
     )
     if draft.status == "sent" and ledger is not None and ledger.status == "confirmed":
         return draft
+    binding = combined_reply_for(session, draft.id)
+    if binding is not None and not reply_matches_current(session, ticket, binding):
+        raise APIError(409, "stale_proposal", "The combined reply is not current")
     if draft.status != "draft":
         raise APIError(409, "stale_proposal", "Only an unsent draft can be sent")
     if ledger is not None and ledger.payload_hash != draft.body_hash:
@@ -388,11 +607,21 @@ def reject_reply(
     body_hash_value: str,
 ) -> None:
     _require_approver(actor)
-    draft = session.scalar(
-        select(ReplyDraft)
+    from resolveai.db.models import CombinedReply
+    from resolveai.services.incident import lock_incident_reply
+
+    located = session.execute(
+        select(ReplyDraft.ticket_id, CombinedReply.id)
+        .outerjoin(CombinedReply, CombinedReply.reply_draft_id == ReplyDraft.id)
         .where(ReplyDraft.id == reply_id, ReplyDraft.tenant_id == actor.tenant_id)
-        .with_for_update()
-    )
+    ).one_or_none()
+    handoff = None
+    if located is not None and located[1] is not None:
+        _lock_ticket(session, actor.tenant_id, located[0])
+        _after_combined_ticket_lock()
+    else:
+        handoff = lock_incident_reply(session, reply_id, sending=False)
+    draft = _locked_reply(session, actor.tenant_id, reply_id)
     if draft is None:
         raise APIError(404, "not_found", "Reply draft was not found")
     if draft.revision != revision or draft.body_hash != body_hash_value:
@@ -400,6 +629,46 @@ def reject_reply(
     if draft.status == "sent":
         raise APIError(409, "already_sent", "A sent reply cannot be rejected")
     if draft.status == "rejected":
+        return
+    if handoff is not None:
+        from resolveai.services.incident import incident_reply_is_current
+
+        current_ticket = session.get(Ticket, draft.ticket_id)
+        if current_ticket is not None and not incident_reply_is_current(
+            session, handoff, current_ticket, draft
+        ):
+            if draft.status == "draft":
+                draft.status = "rejected"
+            return
+    from resolveai.services.combined import combined_reply_for, reply_matches_current
+
+    binding = combined_reply_for(session, draft.id)
+    if binding is not None:
+        current_ticket = session.scalar(
+            select(Ticket).where(Ticket.id == draft.ticket_id).with_for_update()
+        )
+        current = current_ticket is not None and reply_matches_current(
+            session, current_ticket, binding
+        )
+        if draft.status == "draft":
+            draft.status = "rejected"
+            session.flush()
+            audit(
+                session,
+                tenant_id=actor.tenant_id,
+                event_type="reply_rejected",
+                actor_user_id=actor.user_id,
+                ticket_id=draft.ticket_id,
+                run_id=draft.run_id,
+                payload={"reply_id": str(draft.id)},
+            )
+        if not current or current_ticket is None:
+            return
+        from resolveai.services.combined import reduce_combined_reply
+
+        current_run = session.get(Run, draft.run_id)
+        if current_run is not None:
+            reduce_combined_reply(session, current_ticket, current_run)
         return
     draft.status = "rejected"
     ticket = _ticket(session, actor.tenant_id, draft.ticket_id)
@@ -475,9 +744,7 @@ def _recover(
     ledger: ActionLedger,
     tools: Any,
 ) -> ActionLedger:
-    return _accept_verified(
-        session, actor, proposal, ticket, run, ledger, tools, recovered=True
-    )
+    return _accept_verified(session, actor, proposal, ticket, run, ledger, tools, recovered=True)
 
 
 def _accept_verified(
@@ -490,13 +757,22 @@ def _accept_verified(
     tools: Any,
     *,
     recovered: bool,
+    commit: bool = True,
+    prepared: tuple[str, dict[str, Any] | None] | None = None,
 ) -> ActionLedger:
+    if prepared is None:
+        from resolveai.services.tenancy import require_bound_account
+
+        require_bound_account(session, ticket)
+        kind, receipt = _verified_receipt(tools, ticket, proposal)
+    else:
+        kind, receipt = prepared
+    if kind != "ok" or receipt is None:
+        if commit:
+            _mark_uncertain(session, actor, proposal, ticket, run, ledger)
+        return ledger
     run.state = "verifying"
     run.updated_at = utcnow()
-    kind, receipt = _verified_receipt(tools, ticket, proposal)
-    if kind != "ok" or receipt is None:
-        _mark_uncertain(session, actor, proposal, ticket, run, ledger)
-        return ledger
     previous = ledger.result if isinstance(ledger.result, dict) else {}
     if recovered or previous.get("recovered_from_unknown") is True:
         receipt = {**receipt, "recovered_from_unknown": True}
@@ -506,8 +782,51 @@ def _accept_verified(
     ledger.operation_id = str(receipt["operation_id"])
     ledger.result = receipt
     ledger.updated_at = utcnow()
-    _mark_executed(session, actor, proposal, ticket, run, ledger)
+    _mark_executed(session, actor, proposal, ticket, run, ledger, commit=commit)
     return ledger
+
+
+def _verified_cancellation(
+    tools: Any, ticket: Ticket, proposal: Proposal
+) -> tuple[str, dict[str, Any] | None]:
+    """Match this cancellation's operation. Another flag is not a receipt."""
+    from resolveai.services.cancellation import receipt_matches, subscription_views
+
+    operation = tools.get_operation(ticket.account_id, proposal.action_id)
+    listing = tools.list_subscriptions(ticket.account_id)
+    if operation.status != "ok" or listing.status != "ok":
+        if operation.error_code == "not_found" and listing.status == "ok":
+            return "missing", None
+        return "unavailable", None
+    data = operation.data if isinstance(operation.data, dict) else {}
+    viewed = next(
+        (
+            row
+            for row in subscription_views(listing.data)
+            if row.id == str(proposal.target_subscription_id)
+        ),
+        None,
+    )
+    subscription = (
+        {}
+        if viewed is None
+        else {
+            "id": viewed.id,
+            "cancel_at_period_end": viewed.cancel_at_period_end,
+            "current_period_end": viewed.current_period_end,
+        }
+    )
+    command = {
+        "effect_hash": str((proposal.preconditions or {}).get("effect_hash") or ""),
+        "action_id": proposal.action_id,
+        "account_id": str(ticket.account_id),
+        "subscription_id": str(proposal.target_subscription_id),
+        "effective_at": (proposal.preconditions or {}).get("effective_at"),
+    }
+    if receipt_matches(command, data, subscription):
+        result = data.get("result") if isinstance(data.get("result"), dict) else {}
+        return "ok", result
+    return "conflict", None
 
 
 def _verified_receipt(
@@ -526,9 +845,7 @@ def _verified_receipt(
         raw_rows = refunds.data.get("refunds", [])
         if isinstance(raw_rows, list):
             refund_rows = [row for row in raw_rows if isinstance(row, dict)]
-    matching = [
-        row for row in refund_rows if row.get("action_id") == proposal.action_id
-    ]
+    matching = [row for row in refund_rows if row.get("action_id") == proposal.action_id]
     if operation.status != "ok" and not operation_missing:
         return "unavailable", None
     if refunds.status != "ok" and not operation_missing:
@@ -586,10 +903,29 @@ def _mark_uncertain(
     ticket: Ticket,
     run: Run,
     ledger: ActionLedger,
+    *,
+    commit: bool = True,
 ) -> None:
     ledger.status = "unknown"
     ledger.error_code = "unknown"
     ledger.updated_at = utcnow()
+    from resolveai.services.combined import record_financial_state
+
+    if record_financial_state(
+        session, ticket, run, proposal, None, code="uncertain", reason="unknown"
+    ):
+        audit(
+            session,
+            tenant_id=actor.tenant_id,
+            event_type="action_unknown",
+            actor_user_id=actor.user_id,
+            ticket_id=ticket.id,
+            run_id=run.id,
+            payload={"action_id": ledger.action_id},
+        )
+        if commit:
+            session.commit()
+        return
     body = render_reply(
         kind="unknown",
         ticket=ticket,
@@ -620,7 +956,8 @@ def _mark_uncertain(
         run_id=run.id,
         payload={"action_id": ledger.action_id},
     )
-    session.commit()
+    if commit:
+        session.commit()
 
 
 def _as_int(value: Any) -> int | None:
@@ -694,9 +1031,7 @@ def _commit_dispatch(
     return proposal, ticket, run, ledger
 
 
-def _require_current_input(
-    session: Session, proposal: Proposal, ticket: Ticket, run: Run
-) -> None:
+def _require_current_input(session: Session, proposal: Proposal, ticket: Ticket, run: Run) -> None:
     current = latest_input_revision(session, ticket.id)
     bound = (proposal.preconditions or {}).get("input_revision")
     if bound is None or int(bound) != current:
@@ -722,8 +1057,25 @@ def _mark_executed(
     ticket: Ticket,
     run: Run,
     ledger: ActionLedger,
+    *,
+    commit: bool = True,
 ) -> None:
     proposal.status = "executed"
+    from resolveai.services.combined import record_financial_state
+
+    if record_financial_state(session, ticket, run, proposal, None, code="confirmed"):
+        audit(
+            session,
+            tenant_id=actor.tenant_id,
+            event_type="action_confirmed",
+            actor_user_id=actor.user_id,
+            ticket_id=ticket.id,
+            run_id=run.id,
+            payload={"action_id": ledger.action_id, "operation_id": ledger.operation_id},
+        )
+        if commit:
+            session.commit()
+        return
     body = render_reply(
         kind="confirmed",
         ticket=ticket,
@@ -752,7 +1104,8 @@ def _mark_executed(
         run_id=run.id,
         payload={"action_id": ledger.action_id, "operation_id": ledger.operation_id},
     )
-    session.commit()
+    if commit:
+        session.commit()
 
 
 def _proposal_matches_live_state(tools: Any, ticket: Ticket, proposal: Proposal) -> bool:
@@ -822,6 +1175,9 @@ def _proposal_context(
         raise APIError(404, "not_found", "Proposal was not found")
     ticket, run = _lock_ticket_for_proposal(session, peeked)
     proposal = _lock_proposal(session, tenant_id, proposal_id)
+    session.refresh(proposal)
+    session.refresh(ticket)
+    session.refresh(run)
     return proposal, ticket, run
 
 
@@ -849,6 +1205,38 @@ def _require_approver(actor: Any) -> None:
 def _ticket(session: Session, tenant_id: UUID, ticket_id: UUID) -> Ticket:
     ticket = session.get(Ticket, ticket_id)
     if ticket is None or ticket.tenant_id != tenant_id:
+        raise APIError(404, "not_found", "Ticket was not found")
+    return ticket
+
+
+def _locked_reply(session: Session, tenant_id: UUID, reply_id: UUID) -> ReplyDraft | None:
+    """Lock the reply and replace any copy loaded before this wait.
+
+    The HTTP handler may have read the draft before the ticket lock. A later
+    FOR UPDATE returns that same object unless its attributes are reloaded
+    from the row committed by the session that held the lock.
+    """
+    loaded = session.get(ReplyDraft, reply_id)
+    if loaded is not None:
+        session.expire(loaded)
+    draft = session.scalar(
+        select(ReplyDraft)
+        .where(ReplyDraft.id == reply_id, ReplyDraft.tenant_id == tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if draft is not None:
+        session.refresh(draft)
+    return draft
+
+
+def _lock_ticket(session: Session, tenant_id: UUID, ticket_id: UUID) -> Ticket:
+    ticket = session.scalar(
+        select(Ticket)
+        .where(Ticket.id == ticket_id, Ticket.tenant_id == tenant_id)
+        .with_for_update()
+    )
+    if ticket is None:
         raise APIError(404, "not_found", "Ticket was not found")
     return ticket
 

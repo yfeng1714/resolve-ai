@@ -1,0 +1,43 @@
+{
+  "note": "Development labels for the local crc32 buckets and the English lexical index. These are not a hosted semantic-model measurement and they are not an agent-benefit result.",
+  "queries": [
+    {
+      "id": "rare-term",
+      "query": "umber",
+      "note": "The heading is the exact token Umber. Lexical search returns that chunk. The 32-bucket hash places it below the colliding duplicate-settlement chunk.",
+      "top": {
+        "hybrid": [
+          ["rare_umber.md", "rare-policy-2026.11.12", "0"],
+          ["duplicate_refund.md", "refund-policy-2026.10.12", "0"],
+          ["duplicate_refund.md", "refund-policy-2026.10.12", "1"]
+        ],
+        "vector": [
+          ["duplicate_refund.md", "refund-policy-2026.10.12", "0"],
+          ["rare_umber.md", "rare-policy-2026.11.12", "0"],
+          ["duplicate_refund.md", "refund-policy-2026.10.12", "1"]
+        ],
+        "lexical": [
+          ["rare_umber.md", "rare-policy-2026.11.12", "0"]
+        ]
+      }
+    },
+    {
+      "id": "paraphrase",
+      "query": "give the money back for the repeated charge",
+      "note": "The paraphrase shares no content lexemes with the duplicate-refund policy, so the lexical list is empty. The vector order still ranks that policy first. Hybrid follows the vector list.",
+      "top": {
+        "hybrid": [
+          ["duplicate_refund.md", "refund-policy-2026.10.12", "0"],
+          ["conflicting_invoices.md", "refund-policy-2026.10.12", "0"],
+          ["duplicate_refund.md", "refund-policy-2026.10.12", "1"]
+        ],
+        "vector": [
+          ["duplicate_refund.md", "refund-policy-2026.10.12", "0"],
+          ["conflicting_invoices.md", "refund-policy-2026.10.12", "0"],
+          ["duplicate_refund.md", "refund-policy-2026.10.12", "1"]
+        ],
+        "lexical": []
+      }
+    }
+  ]
+}

@@ -118,7 +118,9 @@ def test_duplicate_investigation_cites_policy_and_keeps_the_amount(client, manif
 
 def test_support_cannot_read_approver_only_evidence(client, settings, manifest) -> None:
     del manifest
-    engine = make_engine(settings.oracle_database_url)
+    from tests.support import seeing_engine
+
+    engine = seeing_engine(settings.oracle_database_url)
     with engine.connect() as connection:
         evidence_id = connection.execute(
             text(

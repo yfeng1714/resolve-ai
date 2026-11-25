@@ -14,11 +14,14 @@ from resolveai.http import envelope, request_id_from
 from resolveai.settings import Settings, load_settings
 from resolveai.simulator.service import (
     account_view,
+    apply_period_end_schedule,
     apply_refund,
+    incidents_view,
     invoices_view,
     operation_view,
     payments_view,
     refunds_view,
+    subscriptions_view,
 )
 from resolveai.tools.client import FAULT_HEADER, accepted_fault
 
@@ -34,6 +37,18 @@ class RefundCommand(BaseModel):
     currency: Literal["USD"]
     payload_hash: str = Field(min_length=64, max_length=64)
     expected_payment_version: int = Field(ge=1)
+    policy_version: str = Field(min_length=1, max_length=80)
+
+
+class ScheduleCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["cancel_at_period_end"]
+    action_id: str = Field(min_length=8, max_length=200)
+    account_id: UUID
+    subscription_id: UUID
+    effective_at: str = Field(min_length=27, max_length=27)
+    effect_hash: str = Field(min_length=64, max_length=64)
+    expected_resource_version: int = Field(ge=1)
     policy_version: str = Field(min_length=1, max_length=80)
 
 
@@ -98,6 +113,35 @@ def create_simulator_app(settings: Settings | None = None) -> FastAPI:
         finally:
             session.close()
         return envelope(data=data, request_id=request.state.request_id)
+
+    @app.get("/v1/accounts/{account_id}/incidents")
+    def read_incidents(account_id: UUID, request: Request):
+        return _scoped_read(request, account_id, incidents_view)
+
+    @app.get("/v1/accounts/{account_id}/subscriptions")
+    def read_subscriptions(account_id: UUID, request: Request):
+        return _scoped_read(request, account_id, subscriptions_view)
+
+    @app.post("/v1/subscriptions/schedule-period-end")
+    def schedule_period_end(command: ScheduleCommand, request: Request):
+        scoped = scope_account(request)
+        if command.account_id != scoped:
+            raise APIError(403, "denied", "Account scope does not match the subscription")
+        session = app.state.session_factory()
+        try:
+            _created, data = apply_period_end_schedule(session, command)
+            session.commit()
+        except APIError:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+        return envelope(
+            data=data,
+            request_id=request.state.request_id,
+            operation_id=data.get("operation_id"),
+            resource_version=data.get("resource_version"),
+        )
 
     @app.get("/v1/accounts/{account_id}/invoices")
     def read_invoices(account_id: UUID, request: Request):

@@ -3,11 +3,9 @@ from datetime import timedelta
 from uuid import UUID
 
 from fastapi import Request
-from sqlalchemy import select
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from resolveai.clock import utcnow
-from resolveai.db.models import Membership, UserAccount, UserSession
 from resolveai.domain.passwords import hash_password, hash_token, verify_password
 from resolveai.errors import APIError
 
@@ -36,51 +34,70 @@ def _dummy_hash() -> str:
     return _DUMMY_HASH
 
 
-def authenticate(
-    session: Session, email: str, password: str
-) -> tuple[UserAccount, Membership] | None:
-    normalized = email.strip().lower()
-    user = session.scalar(select(UserAccount).where(UserAccount.email == normalized))
-    if user is None:
+@dataclass(frozen=True)
+class Principal:
+    user_id: UUID
+    tenant_id: UUID
+    role: str
+    display_name: str
+    email: str
+
+
+def _uuid(value: object) -> UUID:
+    return value if isinstance(value, UUID) else UUID(str(value))
+
+
+def authenticate(session: Session, email: str, password: str) -> Principal | None:
+    row = session.execute(
+        text(
+            """
+            SELECT user_id, tenant_id, password_hash, role, display_name, email
+            FROM app.lookup_login(:email)
+            """
+        ),
+        {"email": email},
+    ).mappings().one_or_none()
+    if row is None:
         verify_password(password, _dummy_hash())
         return None
-    if not verify_password(password, user.password_hash):
+    if not verify_password(password, str(row["password_hash"])):
         return None
-    membership = session.scalar(
-        select(Membership).where(
-            Membership.user_id == user.id,
-            Membership.tenant_id == user.tenant_id,
-        )
+    return Principal(
+        user_id=_uuid(row["user_id"]),
+        tenant_id=_uuid(row["tenant_id"]),
+        role=str(row["role"]),
+        display_name=str(row["display_name"]),
+        email=str(row["email"]),
     )
-    if membership is None:
-        return None
-    return user, membership
 
 
-def actor_from_request(request: Request, session: Session) -> Actor:
+def actor_from_cookie(request: Request) -> Actor | None:
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
-        raise APIError(401, "unauthenticated", "Sign in required")
-    row = session.scalar(select(UserSession).where(UserSession.token_hash == hash_token(token)))
-    if row is None or row.expires_at <= utcnow():
-        raise APIError(401, "unauthenticated", "Sign in required")
-    user = session.get(UserAccount, row.user_id)
-    membership = session.scalar(
-        select(Membership).where(
-            Membership.user_id == row.user_id,
-            Membership.tenant_id == row.tenant_id,
-        )
-    )
-    if user is None or membership is None:
-        raise APIError(401, "unauthenticated", "Sign in required")
+        return None
+    auth = request.app.state.auth_factory()
+    try:
+        row = auth.execute(
+            text(
+                """
+                SELECT session_id, user_id, tenant_id, role, display_name, email, csrf_hash
+                FROM app.lookup_session(:token_hash)
+                """
+            ),
+            {"token_hash": hash_token(token)},
+        ).mappings().one_or_none()
+    finally:
+        auth.close()
+    if row is None:
+        return None
     return Actor(
-        user_id=user.id,
-        tenant_id=row.tenant_id,
-        role=membership.role,
-        display_name=user.display_name,
-        email=user.email,
-        session_id=row.id,
-        csrf_hash=row.csrf_hash,
+        user_id=_uuid(row["user_id"]),
+        tenant_id=_uuid(row["tenant_id"]),
+        role=str(row["role"]),
+        display_name=str(row["display_name"]),
+        email=str(row["email"]),
+        session_id=_uuid(row["session_id"]),
+        csrf_hash=str(row["csrf_hash"]),
     )
 
 

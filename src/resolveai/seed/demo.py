@@ -11,17 +11,21 @@ from resolveai.clock import utcnow
 from resolveai.db.models import (
     Account,
     Customer,
+    Incident,
     Invoice,
     Membership,
     Message,
     Operation,
     Payment,
     Refund,
+    Subscription,
     Tenant,
+    TenantAccount,
     Ticket,
     UserAccount,
 )
 from resolveai.db.session import make_engine, make_session_factory
+from resolveai.domain.cancellation import parse_instant
 from resolveai.domain.hashing import canonical_hash, refund_action_id, refund_payload
 from resolveai.domain.passwords import hash_password
 from resolveai.domain.policy import load_refund_policy
@@ -34,6 +38,160 @@ def load_manifest() -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _seed_party(session, party: dict, now) -> None:
+    tenant = party["tenant"]
+    session.add(Tenant(id=UUID(tenant["id"]), slug=tenant["slug"], name=tenant["name"]))
+    session.flush()
+    for user in party["users"]:
+        session.add(
+            UserAccount(
+                id=UUID(user["id"]),
+                tenant_id=UUID(tenant["id"]),
+                email=user["email"].lower(),
+                password_hash=hash_password(user["password"]),
+                display_name=user["display_name"],
+            )
+        )
+    session.flush()
+    for user in party["users"]:
+        session.add(
+            Membership(
+                id=UUID(user["membership_id"]),
+                tenant_id=UUID(tenant["id"]),
+                user_id=UUID(user["id"]),
+                role=user["role"],
+            )
+        )
+    session.flush()
+    for case in party["cases"]:
+        session.add(
+            Customer(
+                id=UUID(case["customer_id"]),
+                display_name=case["display_name"],
+                email=case["email"],
+                created_at=now,
+            )
+        )
+        session.flush()
+        session.add(
+            Account(
+                id=UUID(case["account_id"]),
+                customer_id=UUID(case["customer_id"]),
+                currency="USD",
+                status="active",
+                created_at=now,
+            )
+        )
+        session.flush()
+        invoices = {row["number"]: row for row in case["invoices"]}
+        for invoice in case["invoices"]:
+            session.add(
+                Invoice(
+                    id=UUID(invoice["id"]),
+                    account_id=UUID(case["account_id"]),
+                    number=invoice["number"],
+                    amount_cents=invoice["amount_cents"],
+                    currency="USD",
+                    status=invoice["status"],
+                    issued_at=now - timedelta(days=invoice["issued_days_ago"]),
+                )
+            )
+        session.flush()
+        for payment in case["payments"]:
+            settled_at = None
+            if payment["status"] == "settled":
+                settled_at = (
+                    now
+                    - timedelta(days=payment["settled_days_ago"])
+                    + timedelta(minutes=payment["settled_offset_minutes"])
+                )
+            invoice = invoices[payment["invoice_number"]]
+            session.add(
+                Payment(
+                    id=UUID(payment["id"]),
+                    account_id=UUID(case["account_id"]),
+                    invoice_id=UUID(invoice["id"]),
+                    event_id=payment["event_id"],
+                    amount_cents=payment["amount_cents"],
+                    currency="USD",
+                    status=payment["status"],
+                    settled_at=settled_at,
+                    resource_version=1,
+                    created_at=now,
+                )
+            )
+        session.flush()
+        session.add(
+            TenantAccount(
+                tenant_id=UUID(tenant["id"]),
+                account_id=UUID(case["account_id"]),
+                customer_id=UUID(case["customer_id"]),
+            )
+        )
+        session.flush()
+        session.add(
+            Ticket(
+                id=UUID(case["ticket_id"]),
+                tenant_id=UUID(tenant["id"]),
+                customer_id=UUID(case["customer_id"]),
+                account_id=UUID(case["account_id"]),
+                customer_label=case["display_name"],
+                customer_email=case["email"],
+                subject=case["subject"],
+                status="open",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.flush()
+        session.add(
+            Message(
+                tenant_id=UUID(tenant["id"]),
+                ticket_id=UUID(case["ticket_id"]),
+                revision=1,
+                author_kind="customer",
+                body=case["body"],
+                created_at=now,
+            )
+        )
+        for subscription in case.get("subscriptions") or []:
+            session.add(
+                Subscription(
+                    id=UUID(subscription["id"]),
+                    account_id=UUID(case["account_id"]),
+                    plan_code=subscription["plan_code"],
+                    status="active",
+                    current_period_end=now + timedelta(days=subscription["period_days"]),
+                    cancel_at_period_end=bool(subscription.get("cancel_at_period_end")),
+                    resource_version=int(subscription.get("resource_version") or 1),
+                    created_at=now,
+                )
+            )
+        _add_incidents(session, case, now)
+    import_knowledge(session, UUID(tenant["id"]))
+
+
+def _add_incidents(session, case: dict, now) -> None:
+    for incident in case.get("incidents") or []:
+        session.add(
+            Incident(
+                id=UUID(incident["id"]),
+                account_id=UUID(case["account_id"]),
+                service_code=incident["service_code"],
+                region_code=incident["region_code"],
+                status=incident["status"],
+                started_at=parse_instant(incident["started_at"]),
+                resolved_at=None
+                if incident.get("resolved_at") in (None, "")
+                else parse_instant(incident["resolved_at"]),
+                summary=incident.get("summary") or "Synthetic incident",
+                reference_ids=list(incident.get("reference_ids") or []),
+                resource_version=int(incident.get("resource_version") or 1),
+                created_at=now,
+            )
+        )
+
+
 def seed_demo(settings: Settings | None = None) -> dict[str, int | str]:
     settings = settings or load_settings()
     if settings.resolveai_env != "demo":
@@ -41,9 +199,7 @@ def seed_demo(settings: Settings | None = None) -> dict[str, int | str]:
     engine = make_engine(settings.database_url)
     try:
         with engine.connect() as connection:
-            identity = connection.execute(
-                text("SELECT current_user, current_database()")
-            ).one()
+            identity = connection.execute(text("SELECT current_user, current_database()")).one()
         database_ok = identity.current_database in LOCAL_DATABASES
         user_ok = identity.current_user == "resolveai_demo"
         if not database_ok or not user_ok:
@@ -58,6 +214,12 @@ def seed_demo(settings: Settings | None = None) -> dict[str, int | str]:
                     text(
                         """
                         TRUNCATE TABLE
+                          app.combined_reply,
+                          app.combined_half,
+                          app.incident_handoff,
+                          app.incident_report,
+                          app.tenant_account,
+                          app.subscription_choice,
                           app.audit_event,
                           app.tool_invocation,
                           app.action_ledger,
@@ -81,6 +243,8 @@ def seed_demo(settings: Settings | None = None) -> dict[str, int | str]:
                     text(
                         """
                         TRUNCATE TABLE
+                          simulator.incident,
+                          simulator.subscription,
                           simulator.refund,
                           simulator.operation,
                           simulator.payment,
@@ -160,8 +324,10 @@ def seed_demo(settings: Settings | None = None) -> dict[str, int | str]:
                 for payment in case["payments"]:
                     settled_at = None
                     if payment["status"] == "settled":
-                        settled_at = now - timedelta(days=payment["settled_days_ago"]) + timedelta(
-                            minutes=payment["settled_offset_minutes"]
+                        settled_at = (
+                            now
+                            - timedelta(days=payment["settled_days_ago"])
+                            + timedelta(minutes=payment["settled_offset_minutes"])
                         )
                     invoice = invoices[payment["invoice_number"]]
                     session.add(
@@ -230,6 +396,14 @@ def seed_demo(settings: Settings | None = None) -> dict[str, int | str]:
                         )
                     )
                 session.add(
+                    TenantAccount(
+                        tenant_id=UUID(tenant["id"]),
+                        account_id=UUID(case["account_id"]),
+                        customer_id=UUID(case["customer_id"]),
+                    )
+                )
+                session.flush()
+                session.add(
                     Ticket(
                         id=UUID(case["ticket_id"]),
                         tenant_id=UUID(tenant["id"]),
@@ -254,7 +428,24 @@ def seed_demo(settings: Settings | None = None) -> dict[str, int | str]:
                         created_at=now,
                     )
                 )
+                for subscription in case.get("subscriptions") or []:
+                    session.add(
+                        Subscription(
+                            id=UUID(subscription["id"]),
+                            account_id=UUID(case["account_id"]),
+                            plan_code=subscription["plan_code"],
+                            status="active",
+                            current_period_end=now + timedelta(days=subscription["period_days"]),
+                            cancel_at_period_end=bool(subscription.get("cancel_at_period_end")),
+                            resource_version=int(subscription.get("resource_version") or 1),
+                            created_at=now,
+                        )
+                    )
+                _add_incidents(session, case, now)
             import_knowledge(session, UUID(tenant["id"]))
+            secondary = manifest.get("secondary")
+            if isinstance(secondary, dict):
+                _seed_party(session, secondary, now)
             session.commit()
         return {"tenant": tenant["slug"], "tickets": len(manifest["cases"])}
     finally:

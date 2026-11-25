@@ -51,6 +51,14 @@ Add period-end cancellation (never immediate termination), subscription approval
 checks, incident correlation and handoff (no invented ETA or compensation), multi-intent
 actions, two-tenant isolation, full approval expiry/revocation, hybrid retrieval,
 durable checkpoint/worker and reconciliation. Keep separate per-action results for partial success.
+ADR 0007's refund-grant expiry and revocation were accepted locally.
+ADR 0008's second tenant and row-level security were accepted locally on
+2026-10-28 for that same refund path. ADR 0009's period-end cancellation was
+accepted locally on 2026-11-02. ADR 0010's incident correlation and
+evidence-backed handoff were accepted locally on 2026-11-06. ADR 0011's same-ticket refund and period-end
+cancellation was accepted locally on 2026-11-12. ADR 0012's lexical and vector
+retrieval was accepted locally on 2026-11-25, closing the M3 engineering milestone.
+M4 evaluation and M5 delivery are still required for the full Portfolio lifecycle.
 
 Required recovery tests include concurrent/repeated writes, response lost after simulator
 commit, crash before checkpoint, stale/revoked approval, conditional writes, cross-tenant

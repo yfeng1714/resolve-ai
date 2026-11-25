@@ -1,7 +1,13 @@
 from uuid import UUID
 
 from sqlalchemy import text
-from tests.support import ORIGIN, approver_headers, case_by_key, support_headers
+from tests.support import (
+    ORIGIN,
+    approver_headers,
+    case_by_key,
+    execute_and_settle,
+    support_headers,
+)
 
 from resolveai.agent.provider import FakeProvider, ProviderAction
 from resolveai.clock import utcnow
@@ -90,11 +96,7 @@ def test_approved_refund_is_exact_and_rejection_has_no_side_effect(
         json={"revision": proposal["revision"], "payload_hash": proposal["payload_hash"]},
     )
     assert approved.status_code == 200
-    executed = client.post(
-        f"/proposals/{proposal['id']}/execute",
-        headers=approver,
-        json={"revision": proposal["revision"], "payload_hash": proposal["payload_hash"]},
-    )
+    executed = execute_and_settle(client, settings, proposal, approver)
     assert executed.status_code == 200, executed.text
     action = executed.json()["data"]["actions"][0]
     assert action["status"] == "confirmed"
@@ -206,6 +208,7 @@ def test_stale_and_edited_proposals_do_not_write(client, api_app, settings, mani
     approver = approver_headers(client)
     original = fresh["proposals"][0]
     session = api_app.state.session_factory()
+    session.info["tenant_id"] = manifest["tenant"]["id"]
     try:
         revised = create_refund_proposal(
             session,
@@ -267,6 +270,14 @@ def test_unknown_write_is_queried_not_repeated(client, settings, manifest, resto
         f"/proposals/{proposal['id']}/execute",
         headers={**approver, "X-ResolveAI-Test-Fault": "commit_then_fail"},
         json={"revision": proposal["revision"], "payload_hash": proposal["payload_hash"]},
+    )
+    assert executed.status_code == 200, executed.text
+    from tests.support import settle_recovery
+
+    settle_recovery(settings)
+    executed = client.get(
+        f"/tickets/{case['ticket_id']}",
+        headers=approver,
     )
     assert executed.status_code == 200, executed.text
     action = executed.json()["data"]["actions"][0]

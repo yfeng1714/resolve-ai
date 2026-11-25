@@ -95,6 +95,23 @@ _TOOL_SPECS: dict[str, dict[str, Any]] = {
         "properties": {},
         "required": [],
     },
+    "list_subscriptions": {
+        "description": "List subscriptions on the ticket account. This does not choose one.",
+        "properties": {},
+        "required": [],
+    },
+    "propose_cancellation": {
+        "description": (
+            "Ask the server to apply the period-end rule. Do not send a subscription id."
+        ),
+        "properties": {},
+        "required": [],
+    },
+    "list_incidents": {
+        "description": "List incident records for this ticket account.",
+        "properties": {},
+        "required": [],
+    },
 }
 
 
@@ -552,9 +569,7 @@ def _arguments(value: Any) -> dict[str, Any]:
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError as exc:
-        raise AdapterFailure(
-            "Tool arguments were not valid JSON", "malformed_arguments"
-        ) from exc
+        raise AdapterFailure("Tool arguments were not valid JSON", "malformed_arguments") from exc
     if not isinstance(parsed, dict):
         raise AdapterFailure("Tool arguments were not an object", "malformed_arguments")
     return parsed

@@ -90,9 +90,37 @@ class InvestigationRunner:
                 Run.state.notin_(tuple(_TERMINAL)),
             )
         )
+        revision = latest_input_revision(self.session, self.ticket.id)
         if active is not None:
+            from resolveai.services.incident import current_report
+
+            waiting = self.session.scalar(select(Run).where(Run.id == active).with_for_update())
+            report = current_report(self.session, self.ticket.id)
+            if (
+                waiting is not None
+                and waiting.state == "awaiting_customer"
+                and report is not None
+                and report.input_revision == revision
+                and waiting.message_revision == revision
+            ):
+                waiting.state = "analyzing"
+                waiting.updated_at = utcnow()
+                self.run = waiting
+                self.investigated_revision = revision or 0
+                self._checkpoint()
+                build_investigation_graph(self).invoke(
+                    {
+                        "route": "select",
+                        "model_calls": 0,
+                        "tool_calls": 0,
+                        "replans": 0,
+                        "read_retries": 0,
+                        "stop_reason": "",
+                    }
+                )
+                return waiting
             raise APIError(409, "run_in_progress", "This ticket already has an open run")
-        message_revision = latest_input_revision(self.session, self.ticket.id)
+        message_revision = revision
         provider_name = getattr(self.provider, "provider_name", None)
         provider_name = provider_name or self.settings.model_provider
         now = utcnow()
@@ -223,6 +251,9 @@ class InvestigationRunner:
     def finish(self) -> None:
         if self.run is None or self.halted:
             return
+        from resolveai.services.combined import ensure_investigation_halves
+
+        ensure_investigation_halves(self.session, self.ticket, self.run)
         if self.run.state in {"analyzing", "gathering_evidence", "proposing"}:
             self._fail("incomplete", phrase("incomplete"))
             return
@@ -253,11 +284,21 @@ class InvestigationRunner:
             if self.tool_calls >= self.settings.run_max_tool_calls:
                 self._fail("budget_exhausted", phrase("tool_limit"))
                 return
-            if name in {"propose_refund", "add_internal_note", "handoff_ticket"}:
+            if name in {
+                "propose_refund",
+                "propose_cancellation",
+                "add_internal_note",
+                "handoff_ticket",
+            }:
                 if not self._claim_current_intent():
                     return
                 result = self._dispatch(name)
             else:
+                if name == "list_incidents" and self.run is not None:
+                    from resolveai.services.incident import incident_reads_remaining
+
+                    if not incident_reads_remaining(self.session, self.run.id):
+                        return
                 self._release_before_wait()
                 result = self._dispatch(name)
                 if not self._claim_current_intent():
@@ -272,6 +313,22 @@ class InvestigationRunner:
 
     def _dispatch(self, name: str) -> ToolResult:
         account_id = self.ticket.account_id
+        if name in {
+            "get_customer_account",
+            "list_invoices",
+            "list_payments",
+            "list_refunds",
+            "get_operation_status",
+            "list_subscriptions",
+            "list_incidents",
+        }:
+            from resolveai.services.tenancy import require_bound_account
+
+            require_bound_account(self.session, self.ticket)
+        if name == "list_subscriptions":
+            return self.tools.list_subscriptions(account_id)
+        if name == "list_incidents":
+            return self.tools.list_incidents(account_id)
         if name == "get_customer_account":
             return self.tools.get_customer_account(account_id)
         if name == "list_invoices":
@@ -289,6 +346,7 @@ class InvestigationRunner:
                 tenant_id=self.actor.tenant_id,
                 role=self.actor.role,
                 query=query,
+                mode=self.settings.retrieval_mode,
             )
             return ToolResult(
                 status="ok",
@@ -305,6 +363,8 @@ class InvestigationRunner:
             if not action_id:
                 return _local_error("validation", "action_id is required")
             return self.tools.get_operation(account_id, action_id)
+        if name == "propose_cancellation":
+            return self._propose_cancellation()
         if name == "propose_refund":
             return self._propose()
         if name == "add_internal_note":
@@ -321,6 +381,12 @@ class InvestigationRunner:
     def _propose(self) -> ToolResult:
         if self.run is None:
             return _local_error("internal", "Run is missing")
+        from resolveai.services.incident import refuse_financial_proposal
+
+        try:
+            refuse_financial_proposal(self.session, self.ticket.id)
+        except APIError as exc:
+            return _local_error(exc.error_code, exc.message)
         missing = [name for name in READ_TOOLS if self._latest(name) is None]
         if missing:
             return _local_error(
@@ -380,7 +446,118 @@ class InvestigationRunner:
             request_id=uuid4().hex,
         )
 
+    def _propose_cancellation(self) -> ToolResult:
+        from resolveai.domain.cancellation import classify_subscriptions
+        from resolveai.services.cancellation import (
+            create_cancellation_proposal,
+            current_choice,
+            subscription_views,
+        )
+
+        if self.run is None:
+            return _local_error("internal", "Run is missing")
+        from resolveai.services.incident import refuse_financial_proposal
+
+        try:
+            refuse_financial_proposal(self.session, self.ticket.id)
+        except APIError as exc:
+            return _local_error(exc.error_code, exc.message)
+        observation = self._latest("list_subscriptions")
+        if observation is None:
+            return _local_error("insufficient_evidence", "Subscriptions were not read")
+        choice = current_choice(self.session, self.ticket.id)
+        decision = classify_subscriptions(
+            subscription_views(observation.get("data")),
+            choice_id=None if choice is None else str(choice.subscription_id),
+            now=utcnow(),
+        )
+        if decision.kind != "propose" or decision.subscription_id is None:
+            return _local_error("not_eligible", "No single subscription can be scheduled")
+        selected = next(
+            row
+            for row in subscription_views(observation.get("data"))
+            if row.id == decision.subscription_id
+        )
+        try:
+            proposal = create_cancellation_proposal(
+                self.session,
+                tenant_id=self.actor.tenant_id,
+                ticket_id=self.ticket.id,
+                run_id=self.run.id,
+                actor_user_id=self.actor.user_id,
+                account_id=self.ticket.account_id,
+                subscription=selected,
+                evidence={
+                    "customer_name": self.ticket.customer_label,
+                    "plan_code": selected.plan_code,
+                },
+                observed_input_revision=self.investigated_revision,
+                choice_id=None if choice is None else choice.id,
+            )
+        except APIError as exc:
+            return _local_error(exc.error_code, exc.message)
+        self.run.state = "awaiting_approval"
+        self.ticket.status = "awaiting_approval"
+        self.ticket.updated_at = utcnow()
+        return ToolResult(
+            status="ok",
+            data={
+                "proposal_id": str(proposal.id),
+                "revision": proposal.revision,
+                "action_id": proposal.action_id,
+                "payload_hash": proposal.payload_hash,
+                "effective_at": proposal.preconditions["effective_at"],
+            },
+            error_code=None,
+            retryable=False,
+            operation_id=None,
+            resource_version=selected.resource_version,
+            observed_at=utcnow().isoformat(),
+            request_id=uuid4().hex,
+        )
+
     def _note(self) -> ToolResult:
+        from resolveai.domain.cancellation import intent_gate
+        from resolveai.domain.incident import incident_requested
+
+        if incident_requested(self._snapshot().messages):
+            body = self.pending_reason or phrase("note_incident_wait")
+            append_message(self.session, ticket=self.ticket, author_kind="internal", body=body)
+            if self.pending_args.get("waiting") and self.run is not None:
+                self.run.state = "awaiting_customer"
+                self.awaiting_customer = True
+            return ToolResult(
+                status="ok",
+                data={"body": body, "ignored_model_text": True},
+                error_code=None,
+                retryable=False,
+                operation_id=None,
+                resource_version=None,
+                observed_at=utcnow().isoformat(),
+                request_id=uuid4().hex,
+            )
+
+        if intent_gate(self._snapshot().messages):
+            body = self.pending_reason
+            append_message(self.session, ticket=self.ticket, author_kind="internal", body=body)
+            if self.pending_args.get("waiting"):
+                if self.run is not None:
+                    self.run.state = "awaiting_customer"
+                self.awaiting_customer = True
+            elif self.run is not None:
+                self.run.state = "handed_off"
+                self.ticket.status = "handed_off"
+                self.ticket.updated_at = utcnow()
+            return ToolResult(
+                status="ok",
+                data={"body": body, "ignored_model_text": True},
+                error_code=None,
+                retryable=False,
+                operation_id=None,
+                resource_version=None,
+                observed_at=utcnow().isoformat(),
+                request_id=uuid4().hex,
+            )
         decision = evaluate_refund(self._payment_views(), self._refund_views(), utcnow())
         reason = _reason_text(decision.reasons) or phrase_reason("pending_payment_present")
         body = phrase("note_no_refund", reasons=reason)
@@ -400,6 +577,55 @@ class InvestigationRunner:
         )
 
     def _handoff(self) -> ToolResult:
+        from resolveai.domain.cancellation import intent_gate
+        from resolveai.domain.incident import incident_requested
+        from resolveai.services.incident import create_incident_handoff, current_report
+
+        if incident_requested(self._snapshot().messages):
+            if self.run is None:
+                return _local_error("internal", "Run is missing")
+            if current_report(self.session, self.ticket.id) is None:
+                self.pending_args = {"waiting": True}
+                self.pending_reason = phrase("note_incident_wait")
+                return self._note()
+            try:
+                draft = create_incident_handoff(
+                    self.session,
+                    actor=self.actor,
+                    ticket=self.ticket,
+                    run=self.run,
+                    tools=self.tools,
+                )
+            except APIError as exc:
+                return _local_error(exc.error_code, exc.message)
+            return ToolResult(
+                status="ok",
+                data={"body": draft.body, "ignored_model_text": True},
+                error_code=None,
+                retryable=False,
+                operation_id=None,
+                resource_version=None,
+                observed_at=utcnow().isoformat(),
+                request_id=uuid4().hex,
+            )
+
+        if intent_gate(self._snapshot().messages):
+            body = self.pending_reason
+            append_message(self.session, ticket=self.ticket, author_kind="internal", body=body)
+            if self.run is not None:
+                self.run.state = "handed_off"
+            self.ticket.status = "handed_off"
+            self.ticket.updated_at = utcnow()
+            return ToolResult(
+                status="ok",
+                data={"body": body, "ignored_model_text": True},
+                error_code=None,
+                retryable=False,
+                operation_id=None,
+                resource_version=None,
+                observed_at=utcnow().isoformat(),
+                request_id=uuid4().hex,
+            )
         decision = evaluate_refund(self._payment_views(), self._refund_views(), utcnow())
         reason = _reason_text(decision.reasons) or phrase_reason("unsupported_case")
         body = phrase("note_handoff", reasons=reason)
@@ -526,6 +752,14 @@ class InvestigationRunner:
                 {"revision": row.revision, "author_kind": row.author_kind, "body": row.body}
                 for row in rows
             ]
+        choice = None
+        report = None
+        from resolveai.services.cancellation import current_choice
+        from resolveai.services.incident import current_report
+
+        if self.run is not None:
+            choice = current_choice(self.session, self.ticket.id)
+            report = current_report(self.session, self.ticket.id)
         return RunSnapshot(
             observations=[] if self.run is None else list(self.run.observations),
             messages=messages,
@@ -537,6 +771,9 @@ class InvestigationRunner:
             tool_calls=self.tool_calls,
             replans=self.replans,
             awaiting_customer=self.awaiting_customer,
+            subscription_choice_id=None if choice is None else str(choice.subscription_id),
+            subscription_choice_revision=None if choice is None else choice.input_revision,
+            incident_report_complete=report is not None,
         )
 
     def _append_reason(self, reason: str) -> None:
@@ -570,9 +807,7 @@ class InvestigationRunner:
         investigated = self.investigated_revision
         self.session.rollback()
         self.session.expire_all()
-        ticket = self.session.scalar(
-            select(Ticket).where(Ticket.id == ticket_id).with_for_update()
-        )
+        ticket = self.session.scalar(select(Ticket).where(Ticket.id == ticket_id).with_for_update())
         run = self.session.scalar(select(Run).where(Run.id == run_id).with_for_update())
         current = latest_input_revision(self.session, ticket_id)
         stale = (

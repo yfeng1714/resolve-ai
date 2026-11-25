@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import replace
 from uuid import UUID, uuid4
 
@@ -13,7 +14,7 @@ from tests.test_auth_and_workflow import _investigate, _refund_count
 
 from resolveai.api.security import Actor
 from resolveai.db.models import Membership, Ticket, UserAccount
-from resolveai.db.session import make_engine, make_session_factory
+from resolveai.db.session import make_engine
 from resolveai.services.execution import send_reply
 from resolveai.services.replies import append_message
 from resolveai.tools.client import SimulatorClient, ToolResult
@@ -30,12 +31,71 @@ def _approve(client, proposal: dict) -> dict[str, str]:
     return headers
 
 
-def _execute(client, proposal: dict, headers: dict[str, str]):
-    return client.post(
+def _execute(client, proposal: dict, headers: dict[str, str], settings=None, api_app=None):
+    response = client.post(
         f"/proposals/{proposal['id']}/execute",
         headers=headers,
         json={"revision": proposal["revision"], "payload_hash": proposal["payload_hash"]},
     )
+    if settings is not None and response.status_code == 200:
+        from resolveai.services import recovery
+        from resolveai.worker.__main__ import drain
+
+        original = recovery.BACKOFF_SECONDS
+        recovery.BACKOFF_SECONDS = (0, 0, 0, 0, 0)
+        tools = None
+        ticket_id = response.json()["data"]["ticket"]["id"]
+        try:
+            if api_app is not None:
+                tools = api_app.state.tool_client_factory(settings)
+                from resolveai.db.session import make_engine, make_session_factory
+
+                engine = make_engine(settings.database_url)
+                factory = make_session_factory(engine)
+                try:
+                    return _wait_for_recovery(
+                        client,
+                        headers,
+                        ticket_id,
+                        lambda: _process_once(factory, tools, recovery),
+                    )
+                finally:
+                    engine.dispose()
+            return _wait_for_recovery(
+                client,
+                headers,
+                ticket_id,
+                lambda: drain(settings, limit=1) > 0,
+            )
+        finally:
+            recovery.BACKOFF_SECONDS = original
+            if tools is not None:
+                tools.close()
+    return response
+
+
+def _process_once(factory, tools, recovery) -> bool:
+    with factory() as session:
+        return bool(recovery.process_available(session, tools))
+
+
+def _wait_for_recovery(client, headers, ticket_id: str, process):
+    """Drive the real worker until this ticket leaves the pending ledger.
+
+    A zero backoff can still be a few milliseconds ahead of the database
+    clock, and earlier jobs in the suite can be claimed first. Keep processing
+    until this action is no longer pending.
+    """
+    deadline = time.monotonic() + 8
+    latest = client.get(f"/tickets/{ticket_id}", headers=headers)
+    while time.monotonic() < deadline:
+        status = latest.json()["data"]["actions"][0]["status"]
+        if status != "pending":
+            return latest
+        process()
+        time.sleep(0.02)
+        latest = client.get(f"/tickets/{ticket_id}", headers=headers)
+    return latest
 
 
 def _forged_receipt(**kwargs: object) -> ToolResult:
@@ -103,7 +163,7 @@ def test_success_requires_an_independent_refund(
     proposal = _investigate(client, case["ticket_id"])["proposals"][0]
     headers = _approve(client, proposal)
     _install(api_app, ForgedWrite)
-    executed = _execute(client, proposal, headers)
+    executed = _execute(client, proposal, headers, settings, api_app)
     assert executed.status_code == 200, executed.text
     body = executed.json()["data"]
     assert body["actions"][0]["status"] == "unknown"
@@ -119,7 +179,7 @@ def test_mismatched_receipt_stays_unknown(
     proposal = _investigate(client, case["ticket_id"])["proposals"][0]
     headers = _approve(client, proposal)
     _install(api_app, MismatchedRead)
-    executed = _execute(client, proposal, headers)
+    executed = _execute(client, proposal, headers, settings, api_app)
     assert executed.status_code == 200, executed.text
     body = executed.json()["data"]
     assert body["actions"][0]["status"] == "unknown"
@@ -135,7 +195,7 @@ def test_unavailable_verification_stays_unknown(
     proposal = _investigate(client, case["ticket_id"])["proposals"][0]
     headers = _approve(client, proposal)
     _install(api_app, UnavailableRead)
-    executed = _execute(client, proposal, headers)
+    executed = _execute(client, proposal, headers, settings, api_app)
     assert executed.status_code == 200, executed.text
     payload = executed.json()["data"]
     assert payload["actions"][0]["status"] == "unknown"
@@ -146,8 +206,10 @@ def test_new_input_invalidates_an_approved_refund(client, settings, manifest) ->
     case = case_by_key(manifest, "duplicate-reject")
     proposal = _investigate(client, case["ticket_id"])["proposals"][0]
     _approve(client, proposal)
+    from tests.support import bound_sessions
+
     engine = make_engine(settings.api_database_url)
-    factory = make_session_factory(engine)
+    factory = bound_sessions(engine)
     with factory() as session:
         ticket = session.get(Ticket, UUID(case["ticket_id"]))
         assert ticket is not None
@@ -224,11 +286,13 @@ def test_concurrent_reply_send_returns_one_receipt(
     case = case_by_key(manifest, "duplicate-approve")
     proposal = _investigate(client, case["ticket_id"])["proposals"][0]
     headers = _approve(client, proposal)
-    executed = _execute(client, proposal, headers)
+    executed = _execute(client, proposal, headers, settings)
     assert executed.status_code == 200, executed.text
     reply = executed.json()["data"]["replies"][0]
+    from tests.support import bound_sessions, seeing_engine
+
     engine = make_engine(settings.api_database_url)
-    factory = make_session_factory(engine)
+    factory = bound_sessions(engine)
     approver = _approver(factory)
     entered: list[int] = []
     gate = threading.Barrier(2)
@@ -271,7 +335,7 @@ def test_concurrent_reply_send_returns_one_receipt(
     assert errors == []
     assert receipts[0] == receipts[1]
     assert len(entered) == 1
-    oracle = make_engine(settings.oracle_database_url)
+    oracle = seeing_engine(settings.oracle_database_url)
     with oracle.connect() as connection:
         messages = connection.execute(
             text(
@@ -353,7 +417,9 @@ def test_withdrawal_before_dispatch_writes_nothing(
 
 
 def _ledger_proposal_id(settings, action_id: str) -> str:
-    engine = make_engine(settings.oracle_database_url)
+    from tests.support import seeing_engine
+
+    engine = seeing_engine(settings.oracle_database_url)
     with engine.connect() as connection:
         value = connection.execute(
             text("SELECT proposal_id FROM app.action_ledger WHERE action_id = :action_id"),
@@ -415,7 +481,7 @@ def test_reused_reservation_stays_with_the_new_approval(
     assert fresh["id"] != original["id"]
     assert fresh["status"] == "open"
     headers = _approve(client, fresh)
-    executed = _execute(client, fresh, headers)
+    executed = _execute(client, fresh, headers, settings)
     assert executed.status_code == 200, executed.text
     assert _refund_count(settings, fresh["target_payment_id"]) == 1
     assert _ledger_proposal_id(settings, fresh["action_id"]) == fresh["id"]

@@ -60,6 +60,41 @@ class SimulatorClient:
     def list_refunds(self, account_id: UUID) -> ToolResult:
         return self._read("GET", f"/v1/accounts/{account_id}/refunds", account_id)
 
+    def list_subscriptions(self, account_id: UUID) -> ToolResult:
+        return self._read("GET", f"/v1/accounts/{account_id}/subscriptions", account_id)
+
+    def list_incidents(self, account_id: UUID) -> ToolResult:
+        return self._read("GET", f"/v1/accounts/{account_id}/incidents", account_id)
+
+    def schedule_period_end(
+        self,
+        *,
+        account_id: UUID,
+        subscription_id: UUID,
+        effective_at: str,
+        action_id: str,
+        effect_hash: str,
+        expected_resource_version: int,
+        policy_version: str,
+    ) -> ToolResult:
+        body = {
+            "action": "cancel_at_period_end",
+            "action_id": action_id,
+            "account_id": str(account_id),
+            "subscription_id": str(subscription_id),
+            "effective_at": effective_at,
+            "effect_hash": effect_hash,
+            "expected_resource_version": expected_resource_version,
+            "policy_version": policy_version,
+        }
+        return self._write(
+            "POST",
+            "/v1/subscriptions/schedule-period-end",
+            account_id,
+            json_body=body,
+            fault=None,
+        )
+
     def get_operation(self, account_id: UUID, action_id: str) -> ToolResult:
         return self._read("GET", f"/v1/operations/{action_id}", account_id)
 

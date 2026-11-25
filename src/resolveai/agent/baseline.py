@@ -24,13 +24,33 @@ class BaselineWorkflow:
     prompt_version = "b1-m2-v1"
 
     def next_action(self, snapshot: RunSnapshot) -> ProviderAction:
+        from resolveai.agent.provider import (
+            _cancellation_action,
+            _combined_action,
+            _incident_action,
+        )
+
+        routed = _incident_action(snapshot)
+        if routed is not None:
+            return routed
+        routed = _combined_action(snapshot)
+        if routed is not None:
+            return routed
+        routed = _cancellation_action(snapshot)
+        if routed is not None:
+            return routed
         done = successful_tools(snapshot)
         last = snapshot.observations[-1] if snapshot.observations else None
-        if last and last.get("status") == "ok" and last.get("tool") in {
-            "propose_refund",
-            "handoff_ticket",
-            "add_internal_note",
-        }:
+        if (
+            last
+            and last.get("status") == "ok"
+            and last.get("tool")
+            in {
+                "propose_refund",
+                "handoff_ticket",
+                "add_internal_note",
+            }
+        ):
             return ProviderAction(route="decide", reason=phrase("no_further_read"))
         for name in BILLING_READS:
             if name not in done:

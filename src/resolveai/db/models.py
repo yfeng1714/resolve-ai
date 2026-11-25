@@ -14,7 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -70,6 +70,26 @@ class UserSession(AppBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class TenantAccount(AppBase):
+    __tablename__ = "tenant_account"
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.tenant.id"), primary_key=True)
+    account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+
+
+class SubscriptionChoice(AppBase):
+    __tablename__ = "subscription_choice"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.tenant.id"))
+    ticket_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    subscription_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    actor_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    input_revision: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class Ticket(AppBase):
     __tablename__ = "ticket"
     __table_args__ = (
@@ -108,6 +128,78 @@ class Message(AppBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class IncidentReport(AppBase):
+    __tablename__ = "incident_report"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.tenant.id"))
+    ticket_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.ticket.id"))
+    account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    actor_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.user_account.id"))
+    input_revision: Mapped[int] = mapped_column(Integer)
+    service_code: Mapped[str] = mapped_column(Text)
+    region_code: Mapped[str] = mapped_column(Text)
+    reported_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    request_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class IncidentHandoff(AppBase):
+    __tablename__ = "incident_handoff"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.tenant.id"))
+    ticket_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.ticket.id"))
+    account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.run.id"))
+    report_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    actor_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.user_account.id"))
+    input_revision: Mapped[int] = mapped_column(Integer)
+    reply_draft_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    tool_invocation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    snapshot_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    kind: Mapped[str] = mapped_column(Text)
+    incident_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    incident_resource_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    compensation_requested: Mapped[bool] = mapped_column(Boolean)
+    reason_code: Mapped[str] = mapped_column(Text)
+    next_step: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class CombinedHalf(AppBase):
+    __tablename__ = "combined_half"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.tenant.id"))
+    ticket_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.ticket.id"))
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.run.id"))
+    input_revision: Mapped[int] = mapped_column(Integer)
+    half: Mapped[str] = mapped_column(Text)
+    outcome_version: Mapped[int] = mapped_column(Integer)
+    outcome_code: Mapped[str] = mapped_column(Text)
+    reason_code: Mapped[str] = mapped_column(Text)
+    action_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proposal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    recovery_job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    prior_outcome_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class CombinedReply(AppBase):
+    __tablename__ = "combined_reply"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.tenant.id"))
+    ticket_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.ticket.id"))
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.run.id"))
+    reply_draft_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.reply_draft.id"))
+    input_revision: Mapped[int] = mapped_column(Integer)
+    refund_outcome_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    cancellation_outcome_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class Run(AppBase):
     __tablename__ = "run"
     __table_args__ = (
@@ -143,9 +235,10 @@ class Proposal(AppBase):
     __tablename__ = "proposal"
     __table_args__ = (
         UniqueConstraint("tenant_id", "action_id", "revision"),
-        CheckConstraint("action_type IN ('refund')", name="proposal_action_type"),
-        CheckConstraint("currency = 'USD'", name="proposal_currency"),
-        CheckConstraint("amount_cents > 0", name="proposal_amount"),
+        CheckConstraint(
+            "action_type IN ('refund', 'cancel_at_period_end')",
+            name="proposal_action_type",
+        ),
         CheckConstraint(
             "status IN ('open', 'approved', 'rejected', 'superseded', "
             "'executed', 'stale', 'failed')",
@@ -162,10 +255,15 @@ class Proposal(AppBase):
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
     payload_hash: Mapped[str] = mapped_column(Text)
     policy_version: Mapped[str] = mapped_column(Text)
-    target_payment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
-    target_event_id: Mapped[str] = mapped_column(Text)
-    amount_cents: Mapped[int] = mapped_column(Integer)
-    currency: Mapped[str] = mapped_column(Text)
+    target_payment_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    target_event_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    currency: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_subscription_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    effective_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    subscription_resource_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     preconditions: Mapped[dict[str, Any]] = mapped_column(JSONB)
     evidence: Mapped[dict[str, Any]] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(Text)
@@ -185,6 +283,24 @@ class Approval(AppBase):
     payload_hash: Mapped[str] = mapped_column(Text)
     actor_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.user_account.id"))
     decision: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ApprovalRevocation(AppBase):
+    __tablename__ = "approval_revocation"
+    __table_args__ = (
+        UniqueConstraint("approval_id"),
+        CheckConstraint(
+            "char_length(reason) BETWEEN 1 AND 500",
+            name="approval_revocation_reason",
+        ),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.tenant.id"))
+    approval_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.approval.id"))
+    actor_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.user_account.id"))
+    reason: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -192,7 +308,10 @@ class ActionLedger(AppBase):
     __tablename__ = "action_ledger"
     __table_args__ = (
         UniqueConstraint("tenant_id", "action_id"),
-        CheckConstraint("action_type IN ('refund', 'reply')", name="ledger_action_type"),
+        CheckConstraint(
+            "action_type IN ('refund', 'reply', 'cancel_at_period_end')",
+            name="ledger_action_type",
+        ),
         CheckConstraint(
             "status IN ('pending', 'confirmed', 'rejected', 'unknown')",
             name="ledger_status",
@@ -371,3 +490,68 @@ class Operation(SimBase):
     write_attempts: Mapped[int] = mapped_column(Integer)
     replay_count: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class Subscription(SimBase):
+    __tablename__ = "subscription"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("simulator.account.id"))
+    plan_code: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    current_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    cancel_at_period_end: Mapped[bool] = mapped_column(Boolean)
+    resource_version: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class Incident(SimBase):
+    __tablename__ = "incident"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("simulator.account.id"))
+    service_code: Mapped[str] = mapped_column(Text)
+    region_code: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    summary: Mapped[str] = mapped_column(Text)
+    reference_ids: Mapped[list[str]] = mapped_column(ARRAY(Text))
+    resource_version: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class RecoveryJob(AppBase):
+    __tablename__ = "recovery_job"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('queued', 'leased', 'blocked', 'settled', 'cancelled')",
+            name="recovery_job_state",
+        ),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.tenant.id"))
+    ledger_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.action_ledger.id"))
+    command_generation: Mapped[int] = mapped_column(Integer)
+    proposal_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.proposal.id"))
+    proposal_revision: Mapped[int] = mapped_column(Integer)
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.run.id"))
+    approval_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.approval.id"))
+    authorizer_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.user_account.id"))
+    payload_hash: Mapped[str] = mapped_column(Text)
+    input_revision: Mapped[int] = mapped_column(Integer)
+    payment_resource_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    subscription_resource_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    policy_version: Mapped[str] = mapped_column(Text)
+    command: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    config_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    state: Mapped[str] = mapped_column(Text)
+    owner_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    owner_generation: Mapped[int] = mapped_column(Integer)
+    leased_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer)
+    max_attempts: Mapped[int] = mapped_column(Integer)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    admitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    block_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

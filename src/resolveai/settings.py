@@ -38,6 +38,13 @@ class Settings(BaseModel):
         "postgresql+psycopg://resolveai_oracle:resolveai_oracle_local"
         "@127.0.0.1:55432/resolveai_demo"
     )
+    auth_database_url: str = (
+        "postgresql+psycopg://resolveai_auth:resolveai_auth_local@127.0.0.1:55432/resolveai_demo"
+    )
+    worker_database_url: str = (
+        "postgresql+psycopg://resolveai_worker:resolveai_worker_local"
+        "@127.0.0.1:55432/resolveai_demo"
+    )
     simulator_base_url: str = "http://127.0.0.1:8001"
     simulator_token: str = "resolveai_simulator_local_token"
     simulator_allow_faults: bool = False
@@ -47,6 +54,7 @@ class Settings(BaseModel):
     model_api_key: str = ""
     embedding_provider: str = "fake"
     embedding_model: str = ""
+    retrieval_mode: str = "hybrid"
     llm_budget_usd: Decimal = Decimal("0")
     allow_live: bool = False
     run_max_model_calls: int = Field(default=12, ge=1)
@@ -54,6 +62,7 @@ class Settings(BaseModel):
     run_max_replans: int = Field(default=2, ge=0)
     run_max_read_retries: int = Field(default=2, ge=0)
     session_ttl_hours: int = Field(default=12, ge=1, le=24)
+    approval_ttl_seconds: int = Field(default=86400, ge=1, le=2_592_000)
 
 
 def repo_root() -> Path:
@@ -75,6 +84,14 @@ def _parse_env_file(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip().strip('"').strip("'")
     return values
+
+
+def _role_database_url(base: str, username: str, password: str) -> str:
+    return (
+        make_url(base)
+        .set(username=username, password=password)
+        .render_as_string(hide_password=False)
+    )
 
 
 def _local_database(url: str, label: str) -> None:
@@ -122,9 +139,7 @@ def load_owner_live_settings(environ: dict[str, str] | None = None) -> tuple[Set
         )
     if merged.get("MODEL_API_KEY"):
         raise LiveModelBlocked("MODEL_API_KEY must stay empty; live mode reads OPENAI_API_KEY")
-    settings = _build_settings(merged).model_copy(
-        update={"allow_live": True, "model_api_key": ""}
-    )
+    settings = _build_settings(merged).model_copy(update={"allow_live": True, "model_api_key": ""})
     key = merged.get("OPENAI_API_KEY", "")
     if (
         settings.model_provider != "openai"
@@ -159,10 +174,38 @@ def _build_settings(merged: dict[str, str]) -> Settings:
         raise SettingsError("LLM_BUDGET_USD must be a decimal") from exc
 
     try:
+        approval_ttl_seconds = int(pick("APPROVAL_TTL_SECONDS", "86400"))
+    except ValueError as exc:
+        raise SettingsError("APPROVAL_TTL_SECONDS must be a positive integer") from exc
+
+    database_url = pick("DATABASE_URL", Settings().database_url)
+    auth_database_url = pick(
+        "AUTH_DATABASE_URL",
+        _role_database_url(
+            database_url,
+            "resolveai_auth",
+            pick("RESOLVEAI_AUTH_DB_PASSWORD", "resolveai_auth_local"),
+        ),
+    )
+    worker_database_url = pick(
+        "WORKER_DATABASE_URL",
+        _role_database_url(
+            database_url,
+            "resolveai_worker",
+            pick("RESOLVEAI_WORKER_DB_PASSWORD", "resolveai_worker_local"),
+        ),
+    )
+    embedding_provider = pick("EMBEDDING_PROVIDER", "fake")
+    retrieval_mode = pick("RETRIEVAL_MODE", "hybrid")
+    if retrieval_mode not in {"hybrid", "vector", "lexical"}:
+        raise SettingsError("RETRIEVAL_MODE must be hybrid, vector, or lexical")
+    try:
         settings = Settings(
             resolveai_env=pick("RESOLVEAI_ENV", "demo"),
-            database_url=pick("DATABASE_URL", Settings().database_url),
+            database_url=database_url,
             api_database_url=pick("API_DATABASE_URL", Settings().api_database_url),
+            auth_database_url=auth_database_url,
+            worker_database_url=worker_database_url,
             simulator_database_url=pick(
                 "SIMULATOR_DATABASE_URL", Settings().simulator_database_url
             ),
@@ -174,13 +217,15 @@ def _build_settings(merged: dict[str, str]) -> Settings:
             model_provider=pick("MODEL_PROVIDER", "fake"),
             model_name=merged.get("MODEL_NAME", ""),
             model_api_key=merged.get("MODEL_API_KEY", ""),
-            embedding_provider=pick("EMBEDDING_PROVIDER", "fake"),
+            embedding_provider=embedding_provider,
             embedding_model=merged.get("EMBEDDING_MODEL", ""),
+            retrieval_mode=retrieval_mode,
             llm_budget_usd=budget,
             run_max_model_calls=int(pick("RUN_MAX_MODEL_CALLS", "12")),
             run_max_tool_calls=int(pick("RUN_MAX_TOOL_CALLS", "20")),
             run_max_replans=int(pick("RUN_MAX_REPLANS", "2")),
             run_max_read_retries=int(pick("RUN_MAX_READ_RETRIES", "2")),
+            approval_ttl_seconds=approval_ttl_seconds,
         )
     except ValidationError as exc:
         raise SettingsError(str(exc)) from exc
@@ -192,6 +237,8 @@ def _build_settings(merged: dict[str, str]) -> Settings:
         ("API_DATABASE_URL", settings.api_database_url),
         ("SIMULATOR_DATABASE_URL", settings.simulator_database_url),
         ("ORACLE_DATABASE_URL", settings.oracle_database_url),
+        ("AUTH_DATABASE_URL", settings.auth_database_url),
+        ("WORKER_DATABASE_URL", settings.worker_database_url),
     ):
         _local_database(url, label)
     _local_http(settings.simulator_base_url, "SIMULATOR_BASE_URL")

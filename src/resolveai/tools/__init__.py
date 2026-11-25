@@ -14,4 +14,8 @@ WRITE_ADJACENT_TOOLS = (
     "handoff_ticket",
     "draft_reply",
 )
-ALL_TOOLS = READ_TOOLS + KNOWLEDGE_TOOLS + WRITE_ADJACENT_TOOLS
+SUBSCRIPTION_TOOLS = ("list_subscriptions", "propose_cancellation")
+INCIDENT_TOOLS = ("list_incidents",)
+ALL_TOOLS = (
+    READ_TOOLS + KNOWLEDGE_TOOLS + WRITE_ADJACENT_TOOLS + SUBSCRIPTION_TOOLS + INCIDENT_TOOLS
+)

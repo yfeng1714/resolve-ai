@@ -134,6 +134,23 @@ function Desk({ viewer, onSignOut }: { viewer: Viewer; onSignOut: () => void }) 
     });
   }, [refreshLists]);
 
+  const latestJob = detail?.recovery_jobs.at(-1) ?? null;
+  const linkedProposal =
+    detail?.proposals.find((item) => item.id === latestJob?.proposal_id) ?? null;
+  const waitingOnWorker =
+    latestJob?.state === "queued" ||
+    latestJob?.state === "leased" ||
+    (latestJob?.state === "settled" && linkedProposal?.status === "approved");
+  useEffect(() => {
+    if (!selectedId || !waitingOnWorker) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      refreshLists(selectedId).catch(() => undefined);
+    }, 400);
+    return () => window.clearInterval(timer);
+  }, [refreshLists, selectedId, waitingOnWorker]);
+
   async function choose(ticketId: string) {
     setSelectedId(ticketId);
     setError(null);
@@ -223,9 +240,22 @@ function Desk({ viewer, onSignOut }: { viewer: Viewer; onSignOut: () => void }) 
               run(() => api.decide(proposal.id, "reject", proposal.revision, proposal.payload_hash))
             }
             onExecute={(proposal) => run(() => api.execute(proposal.id, proposal.revision, proposal.payload_hash))}
+            onRevoke={(approvalId, reason) => run(() => api.revoke(approvalId, reason))}
             onSend={(reply) => run(() => api.sendReply(reply.id, reply.revision, reply.body_hash))}
             onRejectReply={(reply) => run(() => api.rejectReply(reply.id, reply.revision, reply.body_hash))}
             onPostMessage={(body) => run(() => api.postMessage(detail.ticket.id, body))}
+            onChoose={(subscriptionId) =>
+              run(async () => {
+                await api.chooseSubscription(detail.ticket.id, subscriptionId);
+                return api.investigate(detail.ticket.id);
+              })
+            }
+            onReport={(report) =>
+              run(async () => {
+                await api.reportIncident(detail.ticket.id, report);
+                return api.investigate(detail.ticket.id);
+              })
+            }
           />
         ) : (
           <section className="empty">
@@ -238,6 +268,89 @@ function Desk({ viewer, onSignOut }: { viewer: Viewer; onSignOut: () => void }) 
   );
 }
 
+function subscriptionOptions(run: Run | null): { id: string; plan_code: string }[] {
+  const observation = [...(run?.observations ?? [])]
+    .reverse()
+    .find((item) => item.tool === "list_subscriptions" && item.status === "ok");
+  const rows = observation?.data.subscriptions;
+  if (!Array.isArray(rows) || rows.length < 2) {
+    return [];
+  }
+  return rows.flatMap((row) => {
+    if (!row || typeof row !== "object") {
+      return [];
+    }
+    const record = row as { id?: string; plan_code?: string; cancel_at_period_end?: boolean };
+    if (!record.id || record.cancel_at_period_end) {
+      return [];
+    }
+    return [{ id: record.id, plan_code: record.plan_code ?? record.id }];
+  });
+}
+
+function IncidentReportForm({
+  testId,
+  submitLabel,
+  defaults,
+  busy,
+  onReport,
+}: {
+  testId: string;
+  submitLabel: string;
+  defaults: {
+    service_code: string;
+    region_code: string;
+    reported_started_at: string;
+    request_id: string;
+  };
+  busy: boolean;
+  onReport: (report: {
+    service_code: string;
+    region_code: string;
+    reported_started_at: string;
+    request_id?: string;
+  }) => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <form
+      className="update"
+      data-testid={testId}
+      onSubmit={(event) => {
+        event.preventDefault();
+        const form = new FormData(event.currentTarget);
+        const requestId = String(form.get("request_id") || "");
+        onReport({
+          service_code: String(form.get("service_code") || ""),
+          region_code: String(form.get("region_code") || ""),
+          reported_started_at: String(form.get("reported_started_at") || ""),
+          ...(requestId ? { request_id: requestId } : {}),
+        });
+      }}
+    >
+      <label>
+        {t.incidentService}
+        <input name="service_code" defaultValue={defaults.service_code} />
+      </label>
+      <label>
+        {t.incidentRegion}
+        <input name="region_code" defaultValue={defaults.region_code} />
+      </label>
+      <label>
+        {t.incidentStart}
+        <input name="reported_started_at" defaultValue={defaults.reported_started_at} />
+      </label>
+      <label>
+        {t.incidentRequest}
+        <input name="request_id" defaultValue={defaults.request_id} />
+      </label>
+      <button type="submit" disabled={busy}>
+        {submitLabel}
+      </button>
+    </form>
+  );
+}
+
 function TicketPane({
   detail,
   busy,
@@ -245,9 +358,12 @@ function TicketPane({
   onApprove,
   onReject,
   onExecute,
+  onRevoke,
   onSend,
   onRejectReply,
   onPostMessage,
+  onChoose,
+  onReport,
 }: {
   detail: TicketDetail;
   busy: boolean;
@@ -255,20 +371,40 @@ function TicketPane({
   onApprove: (proposal: Proposal) => void;
   onReject: (proposal: Proposal) => void;
   onExecute: (proposal: Proposal) => void;
+  onRevoke: (approvalId: string, reason: string) => void;
   onSend: (reply: Reply) => void;
   onRejectReply: (reply: Reply) => void;
   onPostMessage: (body: string) => void;
+  onChoose: (subscriptionId: string) => void;
+  onReport: (report: {
+    service_code: string;
+    region_code: string;
+    reported_started_at: string;
+    request_id?: string;
+  }) => void;
 }) {
   const run = detail.runs.at(-1) ?? null;
-  const proposal = [...detail.proposals].reverse().find((item) => item.status !== "superseded") ?? null;
-  const proposalRun = detail.runs.find((item) => item.id === proposal?.run_id) ?? run;
-  const action = detail.actions.find((item) => item.action_type === "refund") ?? null;
+  const combinedActive = detail.combined?.active === true;
+  const openProposals = detail.proposals.filter((item) => item.status !== "superseded");
+  const proposal = openProposals.at(-1) ?? null;
+  const shownProposals = combinedActive ? openProposals : proposal ? [proposal] : [];
+  const action =
+    detail.actions.find((item) => item.action_id === proposal?.action_id) ?? null;
+  const earlierCancellations = combinedActive
+    ? []
+    : detail.actions.filter(
+        (item) =>
+          item.action_type === "cancel_at_period_end" && item.action_id !== proposal?.action_id,
+      );
   const reply = [...detail.replies].reverse().find((item) => item.status !== "superseded") ?? null;
   const approver = detail.viewer.role === "approver";
   const support = detail.viewer.role === "support";
   const canInvestigate = support && (!run || ["failed", "completed", "handed_off", "cancelled"].includes(run.state));
   const { t, status, author, fill } = useI18n();
   const [update, setUpdate] = useState("");
+  const [revokeReason, setRevokeReason] = useState("");
+  const [correctTicket, setCorrectTicket] = useState<string | null>(null);
+  const correcting = correctTicket === detail.ticket.id;
 
   return (
     <>
@@ -306,24 +442,114 @@ function TicketPane({
             </button>
           </form>
         ) : null}
+        {support && detail.incident?.active && !detail.incident.report ? (
+          <IncidentReportForm
+            testId="incident-report"
+            submitLabel={t.recordIncident}
+            defaults={{
+              service_code: "api",
+              region_code: "us-east",
+              reported_started_at: "2026-10-15T00:00:00.000000Z",
+              request_id: "",
+            }}
+            busy={busy}
+            onReport={onReport}
+          />
+        ) : null}
+        {support && detail.incident?.active && detail.incident.report ? (
+          correcting ? (
+            <IncidentReportForm
+              testId="incident-report-correction"
+              submitLabel={t.recordCorrectedIncident}
+              defaults={{
+                service_code: detail.incident.report.service_code,
+                region_code: detail.incident.report.region_code,
+                reported_started_at: detail.incident.report.reported_started_at ?? "",
+                request_id: detail.incident.report.request_id ?? "",
+              }}
+              busy={busy}
+              onReport={onReport}
+            />
+          ) : (
+            <button type="button" disabled={busy} onClick={() => setCorrectTicket(detail.ticket.id)}>
+              {t.correctIncident}
+            </button>
+          )
+        ) : null}
+        {detail.incident?.handoff ? (
+          <p data-testid="incident-state">
+            {detail.incident.handoff.kind} · {detail.incident.handoff.reason_code}
+          </p>
+        ) : null}
+        {detail.incident?.history?.length ? (
+          <ul data-testid="incident-history">
+            {detail.incident.history.map((item) => (
+              <li key={item.id}>
+                {item.kind} · {item.reason_code}
+              </li>
+            ))}
+          </ul>
+        ) : null}
         {support ? (
           <button type="button" disabled={busy || !canInvestigate} onClick={onInvestigate}>
             {t.investigate}
           </button>
         ) : null}
+        {support
+          ? subscriptionOptions(run).map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                data-testid="choose-subscription"
+                disabled={busy}
+                onClick={() => onChoose(item.id)}
+              >
+                {item.plan_code}
+              </button>
+            ))
+          : null}
         {run ? <RunView run={run} process={detail.process} /> : null}
       </section>
       <aside className="decision" aria-label={t.decisionAria}>
         <h2>{t.decisionAria}</h2>
-        {proposal ? (
-          <article className="proposal">
-            <p className="amount">{formatUsd(proposal.amount_cents)}</p>
+        {detail.combined?.active ? (
+          <ul data-testid="combined-halves">
+            {detail.combined.halves.map((item) => (
+              <li key={item.half}>
+                {item.half} · {item.outcome_code}
+                {item.reason_code ? ` · ${item.reason_code}` : ""}
+              </li>
+            ))}
+          </ul>
+        ) : null}
+        {shownProposals.length ? (
+          shownProposals.map((proposal) => (
+          <article
+            className="proposal"
+            key={proposal.id}
+            data-testid={detail.combined?.active ? "combined-proposal" : undefined}
+          >
+            <p className={proposal.action_type === "cancel_at_period_end" ? "when" : "amount"}>
+              {proposal.amount_cents == null
+                ? formatInstant(proposal.effective_at ?? proposal.action_id)
+                : formatUsd(proposal.amount_cents)}
+            </p>
+            {proposal.action_type === "cancel_at_period_end" && proposal.effective_at ? (
+              <p className="when-exact">{proposal.effective_at}</p>
+            ) : null}
             <p>
-              {fill(t.refundSummary, {
-                currency: proposal.currency,
-                revision: proposal.revision,
-                status: proposal.status === "open" ? t.statusProposalOpen : status(proposal.status),
-              })}
+              {proposal.action_type === "cancel_at_period_end"
+                ? fill(t.cancellationSummary, {
+                    revision: proposal.revision,
+                    status:
+                      proposal.status === "open" ? t.statusProposalOpen : status(proposal.status),
+                  })
+                : fill(t.refundSummary, {
+                    currency: proposal.currency ?? "",
+                    revision: proposal.revision,
+                    status:
+                      proposal.status === "open" ? t.statusProposalOpen : status(proposal.status),
+                  })}
             </p>
             <dl>
               <div>
@@ -339,28 +565,120 @@ function TicketPane({
                 <dd>{proposal.payload_hash.slice(0, 16)}</dd>
               </div>
             </dl>
-            {proposal ? <BillingEvidence proposal={proposal} run={proposalRun} /> : null}
+            {proposal ? (
+              <BillingEvidence
+                proposal={proposal}
+                run={detail.runs.find((item) => item.id === proposal.run_id) ?? run}
+              />
+            ) : null}
             {approver && proposal.status === "open" ? (
               <div className="actions">
                 <button type="button" disabled={busy} onClick={() => onApprove(proposal)}>
-                  {t.approveRefund}
+                  {proposal.action_type === "cancel_at_period_end"
+                    ? t.approveCancellation
+                    : t.approveRefund}
                 </button>
                 <button type="button" className="danger" disabled={busy} onClick={() => onReject(proposal)}>
-                  {t.rejectRefund}
+                  {proposal.action_type === "cancel_at_period_end"
+                    ? t.rejectCancellation
+                    : t.rejectRefund}
                 </button>
               </div>
             ) : null}
-            {approver && proposal.status === "approved" ? (
-              <button type="button" disabled={busy} onClick={() => onExecute(proposal)}>
-                {t.executeRefund}
+            {proposal.approval ? (
+              <div data-testid="grant-status" data-approval-id={proposal.approval.id}>
+                <p>
+                  {fill(t.grantStatus, { label: proposal.approval.label })}
+                  {proposal.approval.expires_at
+                    ? ` · ${fill(t.grantDeadline, { time: proposal.approval.expires_at })}`
+                    : ""}
+                  {proposal.approval.reason
+                    ? ` · ${fill(t.grantRevokedReason, { reason: proposal.approval.reason })}`
+                    : ""}
+                </p>
+                {proposal.grant_history.length > 0 ? (
+                  <ol data-testid="grant-history">
+                    {proposal.grant_history.map((grant) => (
+                      <li key={grant.id}>
+                        {grant.label}
+                        {grant.expires_at ? ` · ${grant.expires_at}` : ""}
+                      </li>
+                    ))}
+                  </ol>
+                ) : null}
+              </div>
+            ) : null}
+            {approver &&
+            proposal.status === "approved" &&
+            proposal.approval?.label === "expired" &&
+            !detail.recovery_jobs.some((job) => job.proposal_id === proposal.id && job.admitted) ? (
+              <button type="button" data-testid="renew-approval" disabled={busy} onClick={() => onApprove(proposal)}>
+                {t.renewApproval}
               </button>
             ) : null}
-            {!approver && proposal.status === "open" ? <p className="hint">{t.supportCannotApprove}</p> : null}
+            {approver && proposal.approval?.label === "valid" ? (
+              <div className="actions">
+                <label>
+                  {t.revokeReason}
+                  <input
+                    data-testid="revoke-reason"
+                    value={revokeReason}
+                    onChange={(event) => setRevokeReason(event.target.value)}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="danger"
+                  disabled={busy || revokeReason.trim() === ""}
+                  onClick={() => onRevoke(proposal.approval?.id ?? "", revokeReason.trim())}
+                >
+                  {proposal.action_type === "cancel_at_period_end"
+                    ? t.revokeCancellation
+                    : t.revokeRefund}
+                </button>
+              </div>
+            ) : null}
+            {approver && proposal.status === "approved" && proposal.approval?.label === "valid" ? (
+              <button type="button" disabled={busy} onClick={() => onExecute(proposal)}>
+                {proposal.action_type === "cancel_at_period_end" ? t.scheduleCancellation : t.executeRefund}
+              </button>
+            ) : null}
+            {proposal.action_type === "cancel_at_period_end" ? (
+              <p data-testid="cancellation-state">
+                {detail.actions.find((item) => item.action_id === proposal.action_id)?.status ===
+                "confirmed"
+                  ? t.cancellationScheduled
+                  : t.cancellationProposed}
+              </p>
+            ) : null}
+            {earlierCancellations.map((item) => (
+              <p key={item.action_id} data-testid="cancellation-history">
+                {t.earlierCancellation} · {status(item.status)}
+              </p>
+            ))}
+            {!approver && proposal.status === "open" ? (
+              <p className="hint">
+                {proposal.action_type === "cancel_at_period_end"
+                  ? t.supportCannotApproveCancellation
+                  : t.supportCannotApprove}
+              </p>
+            ) : null}
+            {detailRecovery(detail, proposal.id) ? (
+              <p data-testid="recovery-state">
+                {fill(t.recoveryState, { state: detailRecovery(detail, proposal.id) ?? "" })}
+              </p>
+            ) : null}
+            {combinedActive
+              ? detail.actions
+                  .filter((item) => item.action_id === proposal.action_id)
+                  .map((item) => <ActionView key={item.action_id} action={item} />)
+              : null}
           </article>
+          ))
         ) : (
           <p className="hint">{t.noProposal}</p>
         )}
-        {action ? <ActionView action={action} /> : null}
+        {!combinedActive && action ? <ActionView action={action} /> : null}
         {reply ? (
           <article className="reply">
             <h3>{t.reviewedReply}</h3>
@@ -423,7 +741,13 @@ function RunView({ run, process }: { run: Run; process: TicketDetail["process"] 
           <h4>{t.citations}</h4>
           <ul>
             {citationsOf(run).map((citation) => (
-              <li key={citation.evidence_id}>
+              <li
+                key={citation.evidence_id}
+                data-evidence-id={citation.evidence_id}
+                data-source-path={citation.source_path}
+                data-heading={citation.heading}
+                data-provenance={citation.provenance}
+              >
                 {citation.title} · {citation.version}
               </li>
             ))}
@@ -436,6 +760,19 @@ function RunView({ run, process }: { run: Run; process: TicketDetail["process"] 
 
 function BillingEvidence({ proposal, run }: { proposal: Proposal; run: Run | null }) {
   const { t } = useI18n();
+  if (proposal.action_type === "cancel_at_period_end") {
+    return (
+      <div className="billing" data-testid="billing-evidence">
+        <h3>{t.cancellationEvidence}</h3>
+        <p>
+          {t.effectiveTime} {formatInstant(proposal.effective_at ?? "")}
+        </p>
+        <p>
+          {t.inputRevision} {proposal.preconditions.input_revision ?? "—"}
+        </p>
+      </div>
+    );
+  }
   const invoices = observationRows(run, "list_invoices", "invoices");
   const payments = observationRows(run, "list_payments", "payments").filter((row) => {
     return !proposal.preconditions.event_id || row.event_id === proposal.preconditions.event_id;
@@ -449,8 +786,11 @@ function BillingEvidence({ proposal, run }: { proposal: Proposal; run: Run | nul
         {t.invoice} {invoiceNumber} · {t.event} {proposal.preconditions.event_id ?? proposal.target_event_id}
       </p>
       <p>
-        {t.expectedRefund} {formatUsd(proposal.amount_cents)} {proposal.currency} · {t.inputRevision}{" "}
-        {proposal.preconditions.input_revision ?? "—"}
+        {proposal.amount_cents == null
+          ? (proposal.effective_at ?? "")
+          : `${t.expectedRefund} ${formatUsd(proposal.amount_cents)} ${proposal.currency ?? ""}`}
+        {" · "}
+        {t.inputRevision} {proposal.preconditions.input_revision ?? "—"}
       </p>
       <p>{t.payments}</p>
       <ul>
@@ -487,7 +827,14 @@ function invoiceLabel(invoices: Record<string, unknown>[], invoiceId: unknown): 
   return match ? String(match.number ?? "") : "";
 }
 
-function citationsOf(run: Run): { evidence_id: string; title: string; version: string }[] {
+function citationsOf(run: Run): {
+  evidence_id: string;
+  title: string;
+  version: string;
+  source_path: string;
+  heading: string;
+  provenance: string;
+}[] {
   const found = [...run.observations].reverse().find((item) => item.tool === "search_knowledge" && item.status === "ok");
   const rows = found?.data.citations;
   if (!Array.isArray(rows)) {
@@ -497,7 +844,14 @@ function citationsOf(run: Run): { evidence_id: string; title: string; version: s
     if (typeof row !== "object" || row === null) {
       return [];
     }
-    const citation = row as { evidence_id?: unknown; title?: unknown; version?: unknown };
+    const citation = row as {
+      evidence_id?: unknown;
+      title?: unknown;
+      version?: unknown;
+      source_path?: unknown;
+      heading?: unknown;
+      provenance?: unknown;
+    };
     if (typeof citation.evidence_id !== "string") {
       return [];
     }
@@ -506,9 +860,35 @@ function citationsOf(run: Run): { evidence_id: string; title: string; version: s
         evidence_id: citation.evidence_id,
         title: String(citation.title ?? ""),
         version: String(citation.version ?? ""),
+        source_path: String(citation.source_path ?? ""),
+        heading: String(citation.heading ?? ""),
+        provenance: String(citation.provenance ?? ""),
       },
     ];
   });
+}
+
+function detailRecovery(detail: TicketDetail, proposalId: string): string | null {
+  return (
+    detail.recovery_jobs.filter((job) => job.proposal_id === proposalId).at(-1)?.state ?? null
+  );
+}
+
+function formatInstant(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  const formatted = new Intl.DateTimeFormat("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "UTC",
+    hourCycle: "h23",
+  }).format(parsed);
+  return `${formatted} UTC`;
 }
 
 function ActionView({ action }: { action: ActionRecord }) {
@@ -516,7 +896,9 @@ function ActionView({ action }: { action: ActionRecord }) {
   const recovered = action.result?.recovered_from_unknown === true;
   return (
     <article className="ledger">
-      <h3>{t.refundResult}</h3>
+      <h3>
+        {action.action_type === "cancel_at_period_end" ? t.cancellationResult : t.refundResult}
+      </h3>
       <p data-testid="action-status">
         {status(action.status)}
         {action.operation_id ? ` · ${action.operation_id}` : ""}

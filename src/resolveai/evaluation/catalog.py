@@ -343,6 +343,9 @@ def _one_refund(client, settings, manifest, api_app) -> None:
     assert approved.status_code == 200
     executed = client.post(f"/proposals/{proposal['id']}/execute", headers=headers, json=body)
     assert executed.status_code == 200, executed.text
+    from resolveai.worker.__main__ import drain
+
+    drain(settings)
     assert _refund_count(settings, proposal["target_payment_id"]) == 1
 
 
@@ -360,7 +363,15 @@ def _lost_response(client, settings, manifest, api_app) -> None:
     fault = {**headers, "X-ResolveAI-Test-Fault": "commit_then_fail"}
     executed = client.post(f"/proposals/{proposal['id']}/execute", headers=fault, json=body)
     assert executed.status_code == 200, executed.text
-    assert executed.json()["data"]["actions"][0]["result"]["recovered_from_unknown"] is True
+    from resolveai.worker.__main__ import drain
+
+    drain(settings)
+    refreshed = client.get(
+        f"/tickets/{_case(manifest, 'duplicate-approve')['ticket_id']}",
+        headers=headers,
+    )
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["data"]["actions"][0]["result"]["recovered_from_unknown"] is True
     repeated = client.post(f"/proposals/{proposal['id']}/execute", headers=fault, json=body)
     assert repeated.status_code == 200
     assert _refund_count(settings, proposal["target_payment_id"]) == 1
@@ -402,6 +413,10 @@ def _approver_hidden(client, settings, manifest, api_app) -> None:
     engine = make_engine(settings.oracle_database_url)
     try:
         with engine.connect() as connection:
+            connection.execute(
+                text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
+                {"tenant_id": "11111111-1111-4111-8111-111111111111"},
+            )
             evidence_id = connection.execute(
                 text(
                     """

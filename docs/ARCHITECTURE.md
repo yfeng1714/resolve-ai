@@ -2,8 +2,15 @@
 
 Status: M1 and the M2 refund path are accepted locally as of 2026-10-18. The recorded
 Luna campaign predates a small offline revision and login patch; that fingerprint was
-not rewritten. Durable recovery is the next Portfolio slice. A second tenant
-and Portfolio recovery are not implemented. The default process remains the fake provider.
+not rewritten. M3.1 one-tenant refund recovery was accepted locally on 2026-10-25.
+After admission, recovery only queries the original action, and an admitted command
+that was never sent may stay blocked. Approval expiry and revocation were accepted locally on 2026-10-26. Two-tenant
+isolation was accepted locally on 2026-10-28. Period-end subscription cancellation
+was accepted locally on 2026-11-02. Incident correlation in ADR 0010 was
+accepted locally on 2026-11-06. Combined refund and period-end cancellation
+is accepted locally in ADR 0011. Hybrid retrieval in ADR 0012 was accepted
+locally on 2026-11-25, closing M3. M4 evaluation and M5 delivery remain pending.
+The default process remains the fake provider.
 
 ```text
 React workbench -> FastAPI (session, ticket, proposal, approval)
@@ -12,7 +19,7 @@ React workbench -> FastAPI (session, ticket, proposal, approval)
                  -> HTTP simulator -> operation query / independent verification
                  -> reviewed reply + audit events
 PostgreSQL: app schema (tickets, runs, proposals, approvals, ledger, knowledge)
-            simulator schema (accounts, invoices, payments, refunds; later subscriptions/incidents)
+            simulator schema (accounts, invoices, payments, refunds, subscriptions)
 Portfolio: persisted worker + checkpoints + reconciliation + second tenant
 ```
 
@@ -26,7 +33,7 @@ Portfolio: persisted worker + checkpoints + reconciliation + second tenant
 | `src/resolveai/agent/` | Bounded graph, provider adapter, fake provider, observations |
 | `src/resolveai/tools/` | Read registry, HTTP client, proposal execution gateway |
 | `src/resolveai/simulator/` | Separate HTTP service and authoritative business records |
-| `src/resolveai/retrieval/` | Import, evidence metadata and access-filtered crc32 token-bucket retrieval |
+| `src/resolveai/retrieval/` | Import, evidence metadata, and access-filtered lexical plus crc32 retrieval |
 | `src/resolveai/evaluation/` | Runner/oracle/reporting; labels excluded from model context |
 | `apps/web/` | React/Vite UI, typed API client and browser acceptance |
 | `fixtures/`, `knowledge/`, `policies/` | Versioned synthetic business/policy data |
@@ -62,10 +69,12 @@ replans, at most two read retries, plus ticket-level cumulative limits.
 ## Retrieval and isolation
 
 Core: one policy snapshot, vector retrieval or another justified simple retrieval
-path, version/effective-date checks and evidence links. Portfolio: historical/conflict
-handling, PostgreSQL lexical + pgvector + RRF; every path checks access before retrieval.
-Keep tenant-scoped identities from M1. Add the second tenant and exercised restricted
-roles/RLS in M3; privileged initialization connections are never runtime connections.
+path, version/effective-date checks and evidence links. Portfolio retrieval is implemented locally in ADR 0012 as PostgreSQL lexical
+search plus the current pgvector path and reciprocal rank fusion. It was accepted
+locally on 2026-11-25. Every path checks access before retrieval.
+Keep tenant-scoped identities from M1. M3.3 applies a second synthetic tenant and
+row-level security on the refund path; privileged initialization connections are
+never runtime connections.
 
 ## Observability
 

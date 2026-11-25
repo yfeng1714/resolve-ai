@@ -61,12 +61,15 @@ export type Proposal = {
   revision: number;
   status: string;
   action_id: string;
-  amount_cents: number;
-  currency: string;
+  amount_cents: number | null;
+  currency: string | null;
+  action_type?: string;
+  effective_at?: string | null;
   payload_hash: string;
   policy_version: string;
-  target_payment_id: string;
-  target_event_id: string;
+  target_payment_id: string | null;
+  target_event_id: string | null;
+  target_subscription_id?: string | null;
   preconditions: {
     event_id?: string;
     amount_cents?: number;
@@ -78,6 +81,16 @@ export type Proposal = {
     invoice_number?: string | null;
     customer_name?: string;
   };
+  approval: GrantView | null;
+  grant_history: GrantView[];
+};
+
+export type GrantView = {
+  id: string;
+  decision: string;
+  label: "valid" | "expired" | "revoked" | "rejected";
+  expires_at: string | null;
+  reason: string | null;
 };
 
 export type ActionRecord = {
@@ -105,9 +118,36 @@ export type TicketDetail = {
   messages: Message[];
   runs: Run[];
   proposals: Proposal[];
+  combined?: {
+    active: boolean;
+    halves: { half: string; outcome_code: string; reason_code: string; action_id: string | null }[];
+  };
   actions: ActionRecord[];
   replies: Reply[];
+  recovery_jobs: RecoveryJob[];
   process: ProcessInfo;
+  incident?: {
+    active: boolean;
+    report: {
+      id: string;
+      service_code: string;
+      region_code: string;
+      reported_started_at: string | null;
+      request_id: string | null;
+      input_revision: number;
+    } | null;
+    handoff: { id: string; kind: string; reason_code: string; incident_id: string | null } | null;
+    history: { id: string; kind: string; reason_code: string; incident_id: string | null }[];
+  };
+};
+
+export type RecoveryJob = {
+  id: string;
+  state: string;
+  block_reason: string | null;
+  admitted: boolean;
+  command_generation: number;
+  proposal_id: string;
 };
 
 type Envelope<T> = {
@@ -195,6 +235,32 @@ export const api = {
     return request<TicketDetail>(`/proposals/${id}/execute`, {
       method: "POST",
       body: JSON.stringify({ revision, payload_hash: payloadHash }),
+    });
+  },
+  chooseSubscription(ticketId: string, subscriptionId: string) {
+    return request<TicketDetail>(`/tickets/${ticketId}/subscription-choice`, {
+      method: "POST",
+      body: JSON.stringify({ subscription_id: subscriptionId }),
+    });
+  },
+  reportIncident(
+    ticketId: string,
+    report: {
+      service_code: string;
+      region_code: string;
+      reported_started_at: string;
+      request_id?: string;
+    },
+  ) {
+    return request<TicketDetail>(`/tickets/${ticketId}/incident-report`, {
+      method: "POST",
+      body: JSON.stringify(report),
+    });
+  },
+  revoke(approvalId: string, reason: string) {
+    return request<TicketDetail>(`/approvals/${approvalId}/revoke`, {
+      method: "POST",
+      body: JSON.stringify({ reason }),
     });
   },
   postMessage(id: string, body: string) {

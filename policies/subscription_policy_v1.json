@@ -1,0 +1,5 @@
+{
+  "policy_version": "subscription-policy-2026.10.28",
+  "effect": "cancel_at_period_end",
+  "immediate_termination": false
+}

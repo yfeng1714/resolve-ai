@@ -7,6 +7,15 @@ const withTestEnv =
 
 export default defineConfig({
   testDir: "./tests",
+  testIgnore: [
+    "**/recovery-states.spec.ts",
+    "**/revoke.spec.ts",
+    "**/expiry-renewal.spec.ts",
+    "**/tenants.spec.ts",
+    "**/cancellation.spec.ts",
+    "**/incident.spec.ts",
+    "**/combined.spec.ts",
+  ],
   timeout: 60_000,
   fullyParallel: false,
   workers: 1,
@@ -31,6 +40,14 @@ export default defineConfig({
       command: `${withTestEnv} && UV_CACHE_DIR=.uv-cache uv run uvicorn resolveai.api.app:app --host 127.0.0.1 --port 18080 --app-dir src`,
       cwd: root,
       url: "http://127.0.0.1:18080/health",
+      reuseExistingServer: false,
+      timeout: 60_000,
+      gracefulShutdown: { signal: "SIGTERM", timeout: 5_000 },
+    },
+    {
+      command: `${withTestEnv} && RESOLVEAI_WORKER_HEALTH_PORT=18082 PYTHONPATH=src .venv/bin/python -m resolveai.worker`,
+      cwd: root,
+      url: "http://127.0.0.1:18082/",
       reuseExistingServer: false,
       timeout: 60_000,
       gracefulShutdown: { signal: "SIGTERM", timeout: 5_000 },

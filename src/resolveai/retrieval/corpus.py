@@ -21,6 +21,20 @@ from resolveai.settings import repo_root
 
 ACCESS_SCOPES = ("operator", "approver")
 _HEADING = re.compile(r"^##\s+(.+)$", re.MULTILINE)
+RRF_K = 60
+CANDIDATE_LIMIT = 20
+# Unicode code-point order. For UTF-8 this matches Python str ordering, and it
+# differs from the database's en_US.utf8 collation on punctuation, case, and
+# non-ASCII text. Ordinal stays a number, so 2 precedes 10.
+_CODE_POINT = 'COLLATE "C"'
+_FILTER = """
+    d.tenant_id = :tenant_id
+    AND c.tenant_id = :tenant_id
+    AND d.is_current
+    AND d.access_scope = ANY(:scopes)
+    AND d.effective_from <= :now
+    AND (d.effective_to IS NULL OR d.effective_to > :now)
+"""
 
 
 def corpus_dir() -> Path:
@@ -60,38 +74,131 @@ def search_knowledge(
     query: str,
     limit: int = 3,
     now: datetime | None = None,
+    mode: str = "hybrid",
 ) -> list[dict[str, str]]:
+    """Search the filtered corpus in hybrid, vector-only, or lexical-only mode.
+
+    Both branches see the same tenant, current-version, access, and effective-date
+    rows before either list is truncated. Lexical search never pads nonmatches.
+    """
+    if mode not in {"hybrid", "vector", "lexical"}:
+        raise ValueError("mode must be hybrid, vector, or lexical")
     scopes = allowed_scopes(role)
-    if not scopes or not query.strip():
+    if not scopes:
         return []
     now = now or utcnow()
-    embedding = vector_literal(embed_text(query))
+    params = {
+        "tenant_id": tenant_id,
+        "scopes": list(scopes),
+        "now": now,
+        "query": query,
+        "candidate_limit": CANDIDATE_LIMIT,
+    }
+    vector_rows = [] if mode == "lexical" else _vector_candidates(session, params)
+    lexical_rows = [] if mode == "vector" else _lexical_candidates(session, params)
+    if mode == "vector":
+        chosen = [(row, "vector") for row in vector_rows[:limit]]
+    elif mode == "lexical":
+        chosen = [(row, "lexical") for row in lexical_rows[:limit]]
+    else:
+        chosen = [
+            (item["row"], _provenance(item["branches"]))
+            for item in fuse_candidates(vector_rows, lexical_rows, limit)
+        ]
+    return [_citation(row, provenance) for row, provenance in chosen]
+
+
+def fuse_candidates(
+    vector_rows: list[dict[str, object]],
+    lexical_rows: list[dict[str, object]],
+    limit: int,
+) -> list[dict[str, object]]:
+    """Reciprocal rank fusion with k = 60, then the logical chunk key."""
+    scored: dict[str, dict[str, object]] = {}
+
+    def add(rows: list[dict[str, object]], branch: str) -> None:
+        for rank, row in enumerate(rows, start=1):
+            key = str(row["id"])
+            item = scored.setdefault(key, {"row": row, "score": 0.0, "branches": set()})
+            item["score"] = float(item["score"]) + (1.0 / (RRF_K + rank))
+            branches = item["branches"]
+            assert isinstance(branches, set)
+            branches.add(branch)
+
+    add(vector_rows, "vector")
+    add(lexical_rows, "lexical")
+    ranked = sorted(scored.values(), key=_fusion_key)
+    return ranked[:limit]
+
+
+def _vector_candidates(session: Session, params: dict[str, object]) -> list[dict[str, object]]:
+    values = embed_text(str(params["query"]))
+    distance = ""
+    query_params = dict(params)
+    if any(value != 0.0 for value in values):
+        distance = "c.embedding OPERATOR(public.<=>) CAST(:embedding AS public.vector), "
+        query_params["embedding"] = vector_literal(values)
     rows = session.execute(
         text(
-            """
+            f"""
             SELECT c.id, d.title, d.version, d.source_path, d.access_scope,
-                   c.heading, c.body
+                   c.heading, c.body, c.ordinal
             FROM app.knowledge_chunk AS c
             JOIN app.knowledge_document AS d ON d.id = c.document_id
-            WHERE d.tenant_id = :tenant_id
-              AND c.tenant_id = :tenant_id
-              AND d.is_current
-              AND d.access_scope = ANY(:scopes)
-              AND d.effective_from <= :now
-              AND (d.effective_to IS NULL OR d.effective_to > :now)
-            ORDER BY c.embedding OPERATOR(public.<=>) CAST(:embedding AS public.vector)
-            LIMIT :limit
+            WHERE {_FILTER}
+            ORDER BY {distance}d.source_path {_CODE_POINT}, d.version {_CODE_POINT}, c.ordinal
+            LIMIT :candidate_limit
             """
         ),
-        {
-            "tenant_id": tenant_id,
-            "scopes": list(scopes),
-            "now": now,
-            "embedding": embedding,
-            "limit": limit,
-        },
+        query_params,
     ).mappings()
-    return [_citation(row) for row in rows]
+    return [dict(row) for row in rows]
+
+
+def _lexical_candidates(session: Session, params: dict[str, object]) -> list[dict[str, object]]:
+    rows = session.execute(
+        text(
+            f"""
+            SELECT c.id, d.title, d.version, d.source_path, d.access_scope,
+                   c.heading, c.body, c.ordinal
+            FROM app.knowledge_chunk AS c
+            JOIN app.knowledge_document AS d ON d.id = c.document_id
+            WHERE {_FILTER}
+              AND websearch_to_tsquery('english', :query) <> ''::tsquery
+              AND to_tsvector('english', c.heading || ' ' || c.body)
+                  @@ websearch_to_tsquery('english', :query)
+            ORDER BY ts_rank(
+                       to_tsvector('english', c.heading || ' ' || c.body),
+                       websearch_to_tsquery('english', :query)
+                     ) DESC,
+                     d.source_path {_CODE_POINT}, d.version {_CODE_POINT}, c.ordinal
+            LIMIT :candidate_limit
+            """
+        ),
+        params,
+    ).mappings()
+    return [dict(row) for row in rows]
+
+
+def _fusion_key(item: dict[str, object]) -> tuple[float, str, str, int]:
+    """Higher score first, then the same code-point path and version as SQL."""
+    row = item["row"]
+    assert isinstance(row, dict)
+    return (
+        -float(item["score"]),
+        str(row["source_path"]),
+        str(row["version"]),
+        int(row["ordinal"]),
+    )
+
+
+def _provenance(branches: object) -> str:
+    assert isinstance(branches, set)
+    if branches == {"vector", "lexical"}:
+        return "both"
+    if "lexical" in branches:
+        return "lexical"
+    return "vector"
 
 
 def get_evidence(
@@ -106,9 +213,10 @@ def get_evidence(
     if not scopes:
         return None
     now = now or utcnow()
-    row = session.execute(
-        text(
-            """
+    row = (
+        session.execute(
+            text(
+                """
             SELECT c.id, d.title, d.version, d.source_path, d.access_scope,
                    c.heading, c.body
             FROM app.knowledge_chunk AS c
@@ -121,14 +229,17 @@ def get_evidence(
               AND d.effective_from <= :now
               AND (d.effective_to IS NULL OR d.effective_to > :now)
             """
-        ),
-        {
-            "evidence_id": evidence_id,
-            "tenant_id": tenant_id,
-            "scopes": list(scopes),
-            "now": now,
-        },
-    ).mappings().first()
+            ),
+            {
+                "evidence_id": evidence_id,
+                "tenant_id": tenant_id,
+                "scopes": list(scopes),
+                "now": now,
+            },
+        )
+        .mappings()
+        .first()
+    )
     if row is None:
         return None
     citation = _citation(row)
@@ -227,10 +338,10 @@ def _split_front_matter(raw: str) -> tuple[dict[str, str], str]:
     return meta, raw[end + 5 :]
 
 
-def _citation(row: object) -> dict[str, str]:
+def _citation(row: object, provenance: str | None = None) -> dict[str, str]:
     mapping = row if isinstance(row, dict) else dict(row)  # type: ignore[arg-type]
     body = str(mapping["body"])
-    return {
+    citation = {
         "evidence_id": str(mapping["id"]),
         "title": str(mapping["title"]),
         "version": str(mapping["version"]),
@@ -239,3 +350,8 @@ def _citation(row: object) -> dict[str, str]:
         "heading": str(mapping["heading"]),
         "snippet": body[:480],
     }
+    if "ordinal" in mapping:
+        citation["ordinal"] = str(mapping["ordinal"])
+    if provenance:
+        citation["provenance"] = provenance
+    return citation

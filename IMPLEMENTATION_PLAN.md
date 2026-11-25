@@ -15,6 +15,16 @@ $0.013109. The earlier 2026-10-17 batch remains historical. A later offline patc
 corrects investigation revisions and the login commit boundary. It was verified
 offline and does not replace the recorded campaign. M2 was accepted on 2026-10-18
 as the local Core MVP.
+M3.1 one-tenant refund recovery was accepted locally on 2026-10-25. After admission
+it only queries the original action, and an admitted command that was never sent may
+stay blocked. M3.2 approval expiry and revocation was accepted locally on 2026-10-26.
+M3.3 two-tenant isolation was accepted locally on 2026-10-28.
+M3.4 period-end cancellation was accepted locally on 2026-11-02.
+M3.5 incident correlation was accepted locally on 2026-11-06 for that bounded slice.
+It is not acceptance of all M3 or the Portfolio. M3.6 same-ticket refund and
+period-end cancellation was accepted locally on 2026-11-12. ADR 0012 hybrid
+retrieval was accepted locally on 2026-11-25, closing the M3 engineering milestone.
+M4 evaluation and M5 delivery remain pending.
 Fake-provider checks remain the development and CI default.
 
 ## 1. Repository audit and constraints
@@ -237,6 +247,207 @@ aggregate pre-call admission/accounting and support resumable batches. Default b
 
 Each slice updates plan/status and runs targeted checks. Preserve the Core/Portfolio
 exit checklists in PRODUCT_SCOPE.md; don't declare completed functionality from mocks.
+
+## 9.1 M3.4 period-end cancellation
+
+The sequence below is implemented locally from ADR 0009 and was accepted locally on 2026-11-02.
+
+1. Add `simulator.subscription` and the period-end schedule endpoint. The
+   operation identity is the action id plus the effect hash. The resource
+   version and `current_period_end > clock_timestamp()` are write guards.
+   Prove replay, payload conflict, version conflict, `already_scheduled`, and
+   `period_elapsed` without a second version bump. Do not add a termination
+   or renewal endpoint.
+2. Make the refund payment fields and `recovery_job.payment_resource_version`
+   nullable, and add the subscription columns from ADR 0009. Enforce the
+   mutually exclusive shapes and the command trigger. Do not insert dummy
+   payment values.
+3. Add `list_subscriptions` and the append-only subscription choice. Implement
+   the decision table in both the fake provider and B1, including the resume
+   after a valid choice. Record those tool sequences as development traces.
+4. Enqueue through the unsent-replacement rules, the current grant, and the
+   existing expiry and revocation rules. Extend `process_available` only when
+   the ledger type and the command type agree. Keep `claim_recovery_job()`
+   unchanged. After admission, restart work is query-only.
+5. Show a proposed period end before confirmation, and "Cancellation
+   scheduled" only when this command's own operation matches. Add browser
+   approve, reject, clarification, and one stale or unknown case on new
+   tickets.
+6. Refuse downgrade while any subscription choice or cancellation-shaped app
+   row exists, and prove the row hashes do not change. From a refund-only
+   database, downgrade and reapply while preserving refund history.
+
+Acceptance tests, all on the fake provider and `resolveai_pytest`:
+
+- Tenants A and B each complete one approved future schedule. The subscription
+  stays `active`, the flag is true, the effective time equals that row's
+  period end, and the version increases once. Refund and payment counts stay
+  at their pre-test values.
+- A version change before enqueue, and another after enqueue but before
+  admission, each keep the old attempt immutable, avoid a POST of the stale
+  command, and allow one new unsent attempt with the same effect hash. A
+  regenerated same-version proposal does not create a second operation.
+  Regeneration after admission does not POST. An old grant and a new grant
+  cannot both admit.
+- Reject, expired grant, revoked grant, a withdrawn input, a guessed
+  subscription id, and a cross-account choice leave the other tenant unchanged
+  and create no operation.
+- Two unscheduled subscriptions, or a mix of scheduled and unscheduled, wait
+  without a proposal. A valid stored choice then schedules only that owned
+  target. An already scheduled set explains every time and does not write.
+  An invalid, stale, or cross-account choice does not propose.
+- "Terminate immediately" creates no operation. A later explicit period-end
+  choice can be proposed and still requires its own approval.
+- Approval that waits past the period end, and a POST attempted after the
+  period end, write nothing. A write committed before that instant still
+  confirms on a later query. A flag set by another operation does not confirm
+  this action id.
+- Kill the worker after admission and again after the simulator write. The
+  replacement process reads the original action. The subscription and
+  operation rows, not the dead process's HTTP response, decide the outcome.
+- The maintained refund, tenant, grant, and recovery suites stay green.
+
+B1 must follow the same choice and resume path. That is a competence check,
+not a claim that one agent is better. Do not start the 240-case evaluation
+from this slice.
+
+## 9.2 M3.5 incident correlation and handoff, accepted locally
+
+ADR 0010 was accepted locally on 2026-11-06 for the bounded incident slice.
+The worker still has no incident command. The checks below are the accepted
+contract. Migration `20261106_0011` enforces the confirmed-evidence shape on
+new writes and does not retrospectively validate older handoff rows. The local
+slice does the following:
+
+1. Add account-scoped `simulator.incident` rows and `GET /v1/accounts/{account_id}/incidents`.
+   The read uses the ticket's bound account. Prove a cross-account id and a
+   cross-tenant id return no row. Do not add a write, an ETA, or a credit field.
+2. Add append-only `app.incident_report` and `app.incident_handoff`, with forced
+   row-level security, tenant-aware foreign keys, and no runtime update or delete.
+   Downgrade refuses while either table has a row. An empty database drops only
+   those objects and `simulator.incident`.
+3. Implement the ordered classifier in the server proposal and handoff path,
+   and call that same classifier from the fake provider and B1. A missing
+   service, region, or start waits for a complete support report. Compensation
+   after a complete report outranks a record match and creates no financial
+   proposal. A forced refund or cancellation call on an incident ticket is
+   refused in the server function.
+4. Persist the handoff from the validation snapshot, at most three account
+   list reads, with the tool invocation, digest, and candidate evidence
+   attached. Create a new incident reply draft bound to that run and input
+   revision. Do not reuse a same-body draft from another run. Do not call the
+   recovery worker. Admitted commands stay unchanged.
+5. Show a known incident, a clarification resume, an unavailable read, and
+   the human reply review in the browser. A newer report before send removes
+   the unsent draft and allows another investigation. Record tool sequences
+   for a record match, a missing start, no overlap, and a changed snapshot
+   as development traces.
+
+Acceptance tests, all on the fake provider and `resolveai_pytest`. These are
+planned checks, not measured results:
+
+- Each tenant sees only its own incidents. One full overlap records that
+  incident id and version and says the match is not proof of cause. A region
+  or service mismatch, two full overlaps, no rows, a resolved time equal to
+  the report start, and a request id that is not listed each have the kind
+  named in ADR 0010. None of those sets `incident_id` except the single full
+  overlap.
+- Missing fields produce no handoff, including when the text also asks for
+  compensation. After a complete report, compensation produces a handoff and
+  no refund, credit, or cancellation operation. A forced provider call on
+  that ticket also creates no financial proposal. A refund ticket without
+  the incident or compensation phrase still refunds. Refund and subscription
+  rows on the incident tickets stay at their pre-test counts.
+- A later complete report resumes. A newer report or ordinary message
+  committed before send supersedes the unsent incident draft and allows a new
+  run. The same reply text does not reuse the old draft. A send that commits
+  first keeps its receipt, and later input creates a new current handoff.
+  An admitted refund or cancellation command is not edited.
+- An unavailable read says the result is unknown and stores no incident id.
+  A new incident that appears while an older row's version is unchanged is
+  reclassified from the whole snapshot. More than three differing reads, or
+  a failed validation read, stores `conflict` or `unavailable` rather than a
+  confirmed id.
+- B1 follows the same observations. That is a competence check, not an
+  agent comparison. Do not start the 240-case evaluation from this slice.
+
+## 9.3 M3.6 combined refund and period-end cancellation, accepted locally
+
+ADR 0011 was accepted locally on 2026-11-12. That acceptance does not close
+M3 and does not accept hybrid retrieval. The ordinary combined family uses
+the existing refund and period-end gateways. Incident and compensation
+tickets still open neither financial action. A same-proposal retry after a
+transient pre-admission read failure requires unchanged input and a live
+exact grant. New input does not inherit the old approval.
+
+What the accepted slices already prove, and what they do not:
+
+| Requirement | Current evidence | Gap |
+| --- | --- | --- |
+| One duplicate refund, its own approval, action id `refund:{payment_id}`, and query-only recovery after admission | Refund, recovery, and combined tests | The refund half stays on that action id after admission |
+| One period-end cancellation, its own approval, action id `cancel_at_period_end:{subscription_id}:{effective_at}`, and its own command binding | Cancellation tests and ADR 0009 | The cancellation half uses the same period-end command |
+| Refund and cancellation phrases together | ADR 0011 and `src/resolveai/services/combined.py` | Accepted locally on 2026-11-12. An immediate phrase still waits for a later period-end choice |
+| Independent grants, stale input, and revocation | Approval tests and the combined grant checks | Each proposal has its own grant. Ordinary tickets still show one current proposal; a combined ticket shows each action |
+| Incident or compensation text | ADR 0010 | Both financial proposals stay refused |
+| Two proposals of different action ids | Combined half and reply rows | Each half has its own outcome version. A confirmed or admitted effect is kept when the ticket is investigated again |
+
+The proposed family is one eligible duplicate refund and one future unscheduled
+subscription on the same account. Each half uses the gateway it already has.
+Approving or settling one does not approve, settle, reverse, or resend the
+other. A confirmed receipt stays. An admitted action that is not yet confirmed
+stays on its original action id and is queried, not described as a definite
+miss. ADR 0011 records each outcome as a new immutable version. The current
+version is the greatest version for that input revision and half. A reply
+binds to those two version ids. A pre-admission unavailable block is
+`not_dispatched`: the attempt was not sent, and the customer is not called
+ineligible. A confirmed section quotes that action's ledger receipt. An
+immediate phrase inside the refund request leaves cancellation waiting for a
+later period-end choice.
+
+## 9.4 M3.7 hybrid policy retrieval, accepted locally
+
+ADR 0012 was accepted locally on 2026-11-25. This acceptance does not authorize
+a hosted embedding model or the M4 ablation. `search_knowledge`
+filters tenant, current version, access scope, and effective dates before either
+branch is ranked. The vector branch is pgvector distance over the 32-dimensional
+crc32 token buckets. The lexical branch keeps a row only when the English
+`tsvector` matches `websearch_to_tsquery`. Hybrid is the default and fuses the
+two limited lists with reciprocal rank fusion, `k = 60`. Vector-only and
+lexical-only use the same function and the same corpus. Ties break on
+`(source_path, document version, chunk ordinal)` in Unicode code-point order
+for the two text fields, and in numeric order for the ordinal. PostgreSQL
+uses `COLLATE "C"` so that order matches fusion. The runtime chunk id is not
+a tie key.
+
+The development catalog in `policies/retrieval_catalog.json` records honest hits
+and misses for a rare term and a paraphrase. It is not a measurement of a hosted
+semantic model and it is not an agent-benefit result.
+
+## 9.5 M3 exit and M4 entry
+
+M3.1 through M3.5 are accepted locally for their own slices. M3.6 same-ticket
+refund and period-end cancellation was accepted locally on 2026-11-12. M3.7
+hybrid retrieval was accepted locally on 2026-11-25, closing M3. Development
+checks cover hybrid, vector-only, and lexical-only modes. The acceptance run
+passed 253 maintained Python tests, 141 distinct independent backend cases,
+23 browser cases, and 15 grouped database/business/citation checks. These
+used the fake provider and zero budget; they are not M4 evaluation results.
+
+These local-demo limits remain after M3 closure. They are not M4 work by
+themselves: post-admission recovery is query-only; an admitted command that
+was never sent may stay blocked; migration `20261106_0011` does not certify
+older handoffs; the simulator bearer token is outside row-level security;
+incident reads do not pay a credit or promise a repair time; immediate
+termination stays unavailable; the crc32 embedding is not live semantic
+retrieval; public hosting is optional.
+
+M4 does not start from this design. It needs its own frozen-set plan and an
+owner spending limit. B0, B1, and B2 would share tools, fixtures, safety
+rules, the retrieval mode flag, and budget caps. The three ablations change
+one factor each: hybrid versus vector-only, no retrieved context, and no
+dynamic replanning. A safety regression is not an agent-benefit result.
+Deterministic money and permission checks stay separate from any later
+comparison of agents.
 
 ## 10. Executable first-stage work list
 

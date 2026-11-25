@@ -20,7 +20,12 @@ def test_runtime_roles_cannot_cross_schemas(settings, seeded) -> None:
     admin = make_engine(settings.database_url)
     try:
         with api.connect() as connection:
-            assert connection.execute(text("SELECT count(*) FROM app.ticket")).scalar_one() == 6
+            assert connection.execute(text("SELECT count(*) FROM app.ticket")).scalar_one() == 0
+            connection.execute(
+                text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
+                {"tenant_id": "11111111-1111-4111-8111-111111111111"},
+            )
+            assert connection.execute(text("SELECT count(*) FROM app.ticket")).scalar_one() == 20
         _rejects(api, "SELECT count(*) FROM simulator.refund")
         _rejects(simulator, "SELECT count(*) FROM app.ticket")
         with oracle.connect() as connection:

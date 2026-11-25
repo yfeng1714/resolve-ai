@@ -11,11 +11,21 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from resolveai.clock import utcnow
-from resolveai.db.models import Account, Customer, Invoice, Operation, Payment, Refund
+from resolveai.db.models import (
+    Account,
+    Customer,
+    Incident,
+    Invoice,
+    Operation,
+    Payment,
+    Refund,
+    Subscription,
+)
+from resolveai.domain.cancellation import canonical_instant
 from resolveai.domain.hashing import canonical_hash, refund_action_id, refund_payload
 from resolveai.domain.policy import (
     PaymentView,
@@ -269,3 +279,135 @@ def _refund_view(row: Refund) -> RefundView:
         amount_cents=row.amount_cents,
         status=row.status,
     )
+
+
+def incidents_view(session: Session, account_id: uuid.UUID) -> dict[str, Any]:
+    _require_account(session, account_id)
+    rows = session.scalars(
+        select(Incident).where(Incident.account_id == account_id).order_by(Incident.id)
+    ).all()
+    return {"incidents": [_incident_dict(row) for row in rows]}
+
+
+def _incident_dict(row: Incident) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "account_id": str(row.account_id),
+        "service_code": row.service_code,
+        "region_code": row.region_code,
+        "status": row.status,
+        "started_at": canonical_instant(row.started_at),
+        "resolved_at": None if row.resolved_at is None else canonical_instant(row.resolved_at),
+        "summary": row.summary,
+        "reference_ids": list(row.reference_ids or []),
+        "resource_version": row.resource_version,
+    }
+
+
+def subscriptions_view(session: Session, account_id: uuid.UUID) -> dict[str, Any]:
+    _require_account(session, account_id)
+    rows = session.scalars(
+        select(Subscription).where(Subscription.account_id == account_id).order_by(Subscription.id)
+    ).all()
+    return {"subscriptions": [_subscription_dict(row) for row in rows]}
+
+
+def apply_period_end_schedule(session: Session, command: Any) -> tuple[bool, dict[str, Any]]:
+    """Replay a matching operation before the first-write guards."""
+    operation = session.scalar(
+        select(Operation).where(Operation.action_id == command.action_id).with_for_update()
+    )
+    if operation is not None:
+        same = (
+            operation.account_id == command.account_id
+            and operation.payload_hash == command.effect_hash
+            and operation.status == "confirmed"
+        )
+        if not same:
+            raise APIError(
+                409,
+                "payload_conflict",
+                "Action identity was used with a different payload",
+            )
+        replayed = dict(operation.result)
+        replayed["replayed"] = True
+        operation.replay_count += 1
+        return False, replayed
+    row = session.scalar(
+        select(Subscription).where(Subscription.id == command.subscription_id).with_for_update()
+    )
+    if row is None or row.account_id != command.account_id:
+        raise APIError(404, "not_found", "Subscription was not found")
+    effective = canonical_instant(row.current_period_end)
+    if row.resource_version != command.expected_resource_version:
+        raise APIError(409, "version_conflict", "Subscription version changed")
+    if effective != command.effective_at:
+        raise APIError(409, "version_conflict", "Subscription period end changed")
+    current = session.scalar(text("SELECT clock_timestamp()"))
+    if row.current_period_end <= current:
+        raise APIError(409, "period_elapsed", "The period end is no longer in the future")
+    if row.cancel_at_period_end:
+        raise APIError(409, "already_scheduled", "Cancellation is already scheduled")
+    row.cancel_at_period_end = True
+    row.resource_version += 1
+    operation_id = uuid.uuid4()
+    result = {
+        "operation_status": "confirmed",
+        "operation_id": str(operation_id),
+        "action_id": command.action_id,
+        "account_id": str(command.account_id),
+        "subscription_id": str(command.subscription_id),
+        "effective_at": effective,
+        "resource_version": row.resource_version,
+        "cancel_at_period_end": True,
+        "replayed": False,
+    }
+    session.add(
+        Operation(
+            action_id=command.action_id,
+            operation_id=operation_id,
+            payload_hash=command.effect_hash,
+            account_id=command.account_id,
+            status="confirmed",
+            result=result,
+            write_attempts=1,
+            replay_count=0,
+            created_at=utcnow(),
+        )
+    )
+    session.flush()
+    # The flush above can wait on a lock until the period has elapsed.
+    fenced = session.execute(
+        text(
+            """
+            UPDATE simulator.subscription
+            SET resource_version = resource_version
+            WHERE id = :id
+              AND account_id = :account_id
+              AND cancel_at_period_end IS TRUE
+              AND resource_version = :version
+              AND current_period_end > clock_timestamp()
+            RETURNING id
+            """
+        ),
+        {
+            "id": row.id,
+            "account_id": row.account_id,
+            "version": row.resource_version,
+        },
+    ).one_or_none()
+    if fenced is None:
+        session.rollback()
+        raise APIError(409, "period_elapsed", "The period end is no longer in the future")
+    return True, result
+
+
+def _subscription_dict(row: Subscription) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "plan_code": row.plan_code,
+        "status": row.status,
+        "cancel_at_period_end": row.cancel_at_period_end,
+        "current_period_end": canonical_instant(row.current_period_end),
+        "resource_version": row.resource_version,
+    }

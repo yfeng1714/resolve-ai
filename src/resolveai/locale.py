@@ -17,6 +17,8 @@ _EN = {
     "pending_no_refund": "A matching payment is still pending, so no refund is proposed.",
     "outside_rule_handoff": "The case is outside the duplicate-refund rule.",
     "evidence_complete": "Billing evidence is complete, so eligibility can be checked.",
+    "note_incident_wait": "A complete incident report is required before an incident can be named.",
+    "note_incident_handoff": "Record the incident handoff from the account read.",
     "look_up_policy": "Look up the current duplicate-refund policy before proposing.",
     "conflict_needs_policy": "Invoice evidence conflicts, so look up the policy before handoff.",
     "refunds_before_proposal": "Read existing refunds before proposing.",
@@ -40,6 +42,35 @@ _EN = {
         "Action {action_id} was not submitted again.\n"
     ),
     "reply_rejected": "Hello {customer_name},\n\nNo refund was issued for this request.\n",
+    "reply_cancellation_rejected": (
+        "Hello {customer_name},\n\nNo cancellation was scheduled for this request.\n"
+    ),
+    "reply_cancellation_confirmed_future": (
+        "Hello {customer_name},\n\n"
+        "Cancellation scheduled for {effective_at}. Access continues until then.\n"
+        "Reference: {operation_id}.\n"
+    ),
+    "reply_cancellation_confirmed_past": (
+        "Hello {customer_name},\n\n"
+        "Cancellation was confirmed for {effective_at}. "
+        "This record does not end access by itself.\n"
+        "Reference: {operation_id}.\n"
+    ),
+    "reply_cancellation_unknown": (
+        "Hello {customer_name},\n\n"
+        "The approved cancellation is not confirmed. Action {action_id} was not submitted again.\n"
+    ),
+    "note_cancellation_wait": (
+        "Choose one owned subscription before a cancellation can be proposed."
+    ),
+    "note_cancellation_explain": "Existing schedule: {reasons}. No further change was made.",
+    "note_cancellation_immediate": (
+        "Immediate termination is not available. "
+        "A period-end schedule needs a separate choice and approval."
+    ),
+    "note_cancellation_combined": (
+        "A refund and a cancellation were both requested. Neither was proposed."
+    ),
     "invoice_clause": " on invoice {invoice_number}",
     "reason.eligible_duplicate": "eligible duplicate payment",
     "reason.pending_payment_present": "a matching payment is still pending",
@@ -64,6 +95,8 @@ _ZH = {
     "pending_no_refund": "有一笔对应付款仍在处理中，因此不提出退款。",
     "outside_rule_handoff": "该案例不在重复扣款退款规则范围内。",
     "evidence_complete": "账单证据已齐全，可以核对是否符合退款条件。",
+    "note_incident_wait": "在指出事件之前，需要一份完整的事件报告。",
+    "note_incident_handoff": "根据账户读取记录事件移交。",
     "look_up_policy": "提出退款前先查阅当前的重复扣款退款政策。",
     "conflict_needs_policy": "发票证据相互冲突，移交前先查阅对应政策。",
     "refunds_before_proposal": "提出退款前先读取已有退款。",
@@ -86,6 +119,25 @@ _ZH = {
         "已批准的 {amount} 美元退款尚未确认。未再次提交操作 {action_id}。\n"
     ),
     "reply_rejected": "{customer_name}，您好：\n\n此请求未发放退款。\n",
+    "reply_cancellation_rejected": "{customer_name}，您好：\n\n此请求未安排取消。\n",
+    "reply_cancellation_confirmed_future": (
+        "{customer_name}，您好：\n\n"
+        "已安排在 {effective_at} 取消。在此之前仍可使用。\n"
+        "参考号：{operation_id}。\n"
+    ),
+    "reply_cancellation_confirmed_past": (
+        "{customer_name}，您好：\n\n"
+        "已确认安排在 {effective_at} 取消。这条记录本身不会结束访问。\n"
+        "参考号：{operation_id}。\n"
+    ),
+    "reply_cancellation_unknown": (
+        "{customer_name}，您好：\n\n"
+        "已批准的取消尚未确认。动作 {action_id} 没有被再次提交。\n"
+    ),
+    "note_cancellation_wait": "需要先选择本账户下的一个订阅，才能提出取消。",
+    "note_cancellation_explain": "已有安排：{reasons}。没有再次更改。",
+    "note_cancellation_immediate": "不能立即终止。按周期结束取消需要单独的选择和批准。",
+    "note_cancellation_combined": "退款和取消被同时提出。两者都没有生成提案。",
     "invoice_clause": "（发票 {invoice_number}）",
     "reason.eligible_duplicate": "符合条件的重复付款",
     "reason.pending_payment_present": "有一笔对应付款仍在处理中",

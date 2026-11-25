@@ -11,8 +11,18 @@ payment or customer messaging service. The default process uses a fake model and
 zero budget. A live model is a separate process and stays off unless the owner
 turns it on.
 
-The current build covers duplicate-payment refunds for one tenant. Subscriptions,
-a second tenant, and recovery after a process crash are not included.
+The current build covers duplicate-payment refunds for two synthetic tenants
+and can schedule a subscription cancellation at the current period end.
+That cancellation path was accepted locally on 2026-11-02.
+Incident correlation was accepted locally on 2026-11-06.
+A refund and a period-end cancellation on the same ticket were accepted locally
+on 2026-11-12. Hybrid policy retrieval was accepted locally on 2026-11-25,
+closing M3. Evaluation and final delivery (M4–M5) remain pending.
+The worker executes an approved refund and, after a restart, queries that same
+action. A command that was admitted but never sent can remain blocked. The
+simulator's shared bearer token is a local-demo limit and is not the tenant
+boundary. An approver can revoke a refund grant, and a grant expires on a
+development timer.
 
 See [product scope](docs/PRODUCT_SCOPE.md), [architecture](docs/ARCHITECTURE.md),
 and [decisions](docs/adr/README.md).
@@ -31,11 +41,12 @@ make migrate
 make seed
 ```
 
-Start the three local processes in separate terminals:
+Start the local processes in separate terminals:
 
 ```sh
 make simulator
 make api
+make worker
 make web
 ```
 
@@ -70,8 +81,13 @@ corepack pnpm --dir apps/web test:e2e
 `make test` runs Ruff and pytest. Playwright drives one approved refund and one rejected
 proposal, and creates `resolveai_pytest` itself when that database is missing. Both suites
 use that local database. Playwright serves the API on port 18080, the simulator on port
-18081, and the workbench on port 15173. Run one suite at a time. `make seed` loads
-`resolveai_demo`. Run `make migrate` before seeding so the policy tables exist.
+18081, and the workbench on port 15173. Run one suite at a time. The recovery-state
+browser check is `corepack pnpm --dir apps/web exec playwright test -c playwright.recovery.config.ts`.
+Revoke-before-admission and expired-grant renewal are
+`corepack pnpm --dir apps/web exec playwright test -c playwright.lifecycle.config.ts`.
+The two-tenant queue check is
+`corepack pnpm --dir apps/web exec playwright test -c playwright.tenants.config.ts`.
+`make seed` loads `resolveai_demo`. Run `make migrate` before seeding so the policy tables exist.
 
 A refund amount comes from the policy and the payment record. Customer text does not
 set it, and support cannot approve their own proposal. If a refund response is lost,

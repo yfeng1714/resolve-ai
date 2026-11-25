@@ -17,7 +17,8 @@ from resolveai.api.security import (
     CSRF_COOKIE,
     SESSION_COOKIE,
     Actor,
-    actor_from_request,
+    Principal,
+    actor_from_cookie,
     authenticate,
     require_write_guards,
     session_lifetime,
@@ -56,10 +57,28 @@ class MessageRequest(BaseModel):
     body: str = Field(min_length=1, max_length=4000)
 
 
+class ChoiceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    subscription_id: UUID
+
+
+class IncidentReportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    service_code: str = Field(min_length=1, max_length=32)
+    region_code: str = Field(min_length=1, max_length=32)
+    reported_started_at: str = Field(min_length=20, max_length=40)
+    request_id: str | None = None
+
+
 class RevisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     revision: int = Field(ge=1)
     payload_hash: str = Field(min_length=64, max_length=64)
+
+
+class RevokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class ReplyRevisionRequest(BaseModel):
@@ -92,6 +111,7 @@ def create_api_app(
     engine = make_engine(settings.api_database_url)
     app.state.engine = engine
     app.state.session_factory = make_session_factory(engine)
+    app.state.auth_factory = make_session_factory(make_engine(settings.auth_database_url))
     app.state.allow_live = False
     app.state.provider_factory = FakeProvider
     if settings.allow_live:
@@ -142,7 +162,11 @@ def create_api_app(
             reset_locale(token)
 
     def get_db(request: Request) -> Iterator[Session]:
+        request.state.actor = actor_from_cookie(request)
         db = request.app.state.session_factory()
+        actor = request.state.actor
+        if actor is not None:
+            db.info["tenant_id"] = str(actor.tenant_id)
         try:
             yield db
             db.commit()
@@ -153,7 +177,11 @@ def create_api_app(
             db.close()
 
     def current_actor(request: Request, db: Session = Depends(get_db)) -> Actor:
-        return actor_from_request(request, db)
+        del db
+        actor = getattr(request.state, "actor", None)
+        if actor is None:
+            raise APIError(401, "unauthenticated", "Sign in required")
+        return actor
 
     def guarded_actor(request: Request, actor: Actor = Depends(current_actor)) -> Actor:
         require_write_guards(request, actor)
@@ -194,43 +222,50 @@ def create_api_app(
         )
 
     @app.post("/sessions")
-    def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)) -> Response:
+    def login(body: LoginRequest, request: Request) -> Response:
         if request.headers.get("origin", "") != settings.web_origin:
             raise APIError(403, "csrf", "Origin was rejected")
-        found = authenticate(db, body.email, body.password)
+        auth = request.app.state.auth_factory()
+        try:
+            found: Principal | None = authenticate(auth, body.email, body.password)
+        finally:
+            auth.close()
         if found is None:
             raise APIError(401, "invalid_credentials", "Sign-in failed")
-        user, membership = found
         token = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(32)
         now = utcnow()
-        db.add(
-            UserSession(
-                tenant_id=user.tenant_id,
-                user_id=user.id,
-                token_hash=hash_token(token),
-                csrf_hash=hash_token(csrf),
-                expires_at=now + session_lifetime(settings.session_ttl_hours),
-                created_at=now,
-            )
-        )
-        audit(
-            db,
-            tenant_id=user.tenant_id,
-            event_type="login",
-            actor_user_id=user.id,
-            payload={"role": membership.role},
-        )
+        db = request.app.state.session_factory()
+        db.info["tenant_id"] = str(found.tenant_id)
         try:
+            db.add(
+                UserSession(
+                    tenant_id=found.tenant_id,
+                    user_id=found.user_id,
+                    token_hash=hash_token(token),
+                    csrf_hash=hash_token(csrf),
+                    expires_at=now + session_lifetime(settings.session_ttl_hours),
+                    created_at=now,
+                )
+            )
+            audit(
+                db,
+                tenant_id=found.tenant_id,
+                event_type="login",
+                actor_user_id=found.user_id,
+                payload={"role": found.role},
+            )
             db.commit()
         except Exception as exc:
             db.rollback()
             raise APIError(503, "unavailable", "Sign-in could not be saved") from exc
+        finally:
+            db.close()
         response = envelope(
             data={
-                "email": user.email,
-                "display_name": user.display_name,
-                "role": membership.role,
+                "email": found.email,
+                "display_name": found.display_name,
+                "role": found.role,
             },
             request_id=request.state.request_id,
         )
@@ -344,6 +379,75 @@ def create_api_app(
             raise APIError(404, "not_found", "Ticket was not found")
         append_message(db, ticket=ticket, author_kind="operator", body=body.body)
         invalidate_pending_intent(db, ticket)
+        from resolveai.services.incident import invalidate_incident_reply
+        from resolveai.services.recovery import cancel_pre_admission
+
+        invalidate_incident_reply(db, ticket)
+        cancel_pre_admission(db, ticket)
+        ticket.updated_at = utcnow()
+        return _detail(db, actor, ticket_id, request)
+
+    @app.post("/tickets/{ticket_id}/subscription-choice")
+    def choose_subscription(
+        ticket_id: UUID,
+        body: ChoiceRequest,
+        request: Request,
+        actor: Actor = Depends(guarded_actor),
+        db: Session = Depends(get_db),
+    ) -> Response:
+        if actor.role != "support":
+            raise APIError(403, "denied", "Only support can record a subscription choice")
+        ticket = db.scalar(
+            select(Ticket)
+            .where(Ticket.id == ticket_id, Ticket.tenant_id == actor.tenant_id)
+            .with_for_update()
+        )
+        if ticket is None:
+            raise APIError(404, "not_found", "Ticket was not found")
+        from resolveai.services.cancellation import record_subscription_choice
+
+        tools = request.app.state.tool_client_factory(settings)
+        try:
+            record_subscription_choice(
+                db,
+                actor=actor,
+                ticket=ticket,
+                subscription_id=body.subscription_id,
+                tools=tools,
+            )
+        finally:
+            tools.close()
+        ticket.updated_at = utcnow()
+        return _detail(db, actor, ticket_id, request)
+
+    @app.post("/tickets/{ticket_id}/incident-report")
+    def record_incident(
+        ticket_id: UUID,
+        body: IncidentReportRequest,
+        request: Request,
+        actor: Actor = Depends(guarded_actor),
+        db: Session = Depends(get_db),
+    ) -> Response:
+        if actor.role != "support":
+            raise APIError(403, "denied", "Only support can record an incident report")
+        ticket = db.scalar(
+            select(Ticket)
+            .where(Ticket.id == ticket_id, Ticket.tenant_id == actor.tenant_id)
+            .with_for_update()
+        )
+        if ticket is None:
+            raise APIError(404, "not_found", "Ticket was not found")
+        from resolveai.services.incident import record_incident_report
+
+        record_incident_report(
+            db,
+            actor=actor,
+            ticket=ticket,
+            service_code=body.service_code,
+            region_code=body.region_code,
+            reported_started_at=body.reported_started_at,
+            request_id=body.request_id,
+        )
         ticket.updated_at = utcnow()
         return _detail(db, actor, ticket_id, request)
 
@@ -408,6 +512,7 @@ def create_api_app(
             proposal_id=proposal_id,
             revision=body.revision,
             payload_hash=body.payload_hash,
+            ttl_seconds=request.app.state.settings.approval_ttl_seconds,
         )
         return _detail(db, actor, proposal.ticket_id, request)
 
@@ -428,9 +533,31 @@ def create_api_app(
                 revision=body.revision,
                 payload_hash=body.payload_hash,
                 tools=tools,
+                ttl_seconds=request.app.state.settings.approval_ttl_seconds,
             )
         finally:
             tools.close()
+        return _detail(db, actor, proposal.ticket_id, request)
+
+    @app.post("/approvals/{approval_id}/revoke")
+    def revoke(
+        approval_id: UUID,
+        body: RevokeRequest,
+        request: Request,
+        actor: Actor = Depends(guarded_actor),
+        db: Session = Depends(get_db),
+    ) -> Response:
+        from resolveai.services.grants import revoke_approval
+
+        created = revoke_approval(db, actor=actor, approval_id=approval_id, reason=body.reason)
+        from resolveai.db.models import Approval, Proposal
+
+        approval = db.get(Approval, created.approval_id)
+        if approval is None:
+            raise APIError(404, "not_found", "Approval was not found")
+        proposal = db.get(Proposal, approval.proposal_id)
+        if proposal is None:
+            raise APIError(404, "not_found", "Approval was not found")
         return _detail(db, actor, proposal.ticket_id, request)
 
     @app.post("/proposals/{proposal_id}/execute")
@@ -457,6 +584,7 @@ def create_api_app(
                 payload_hash=body.payload_hash,
                 tools=tools,
                 fault=fault,
+                model_name=request.app.state.settings.model_name,
             )
         finally:
             tools.close()
@@ -482,6 +610,41 @@ def create_api_app(
         if proposal is None:
             raise APIError(404, "not_found", "Action was not found")
         return _detail(db, actor, proposal.ticket_id, request)
+
+    @app.post("/recovery-jobs/{job_id}/requeue")
+    def requeue_job(
+        job_id: UUID,
+        request: Request,
+        actor: Actor = Depends(guarded_actor),
+        db: Session = Depends(get_db),
+    ) -> Response:
+        from resolveai.services.recovery import requeue_queries
+
+        job = requeue_queries(db, actor=actor, job_id=job_id)
+        from resolveai.db.models import Proposal
+
+        proposal = db.get(Proposal, job.proposal_id)
+        if proposal is None:
+            raise APIError(404, "not_found", "Recovery job was not found")
+        return _detail(db, actor, proposal.ticket_id, request)
+
+    @app.get("/recovery-jobs/{job_id}/consistency")
+    def recovery_consistency(
+        job_id: UUID,
+        request: Request,
+        actor: Actor = Depends(current_actor),
+        db: Session = Depends(get_db),
+    ) -> Response:
+        from resolveai.services.recovery import consistency_report
+
+        report = consistency_report(db, tenant_id=actor.tenant_id, job_id=job_id)
+        if not report["consistent"]:
+            raise APIError(
+                409,
+                "inconsistent_recovery",
+                "Settled recovery does not match the ledger",
+            )
+        return envelope(data=report, request_id=request.state.request_id)
 
     @app.post("/reply-drafts/{reply_id}/approve-and-send")
     def approve_and_send(

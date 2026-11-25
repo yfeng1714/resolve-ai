@@ -42,6 +42,8 @@ def pytest_database_settings(base: Settings | None = None) -> Settings:
         update={
             "database_url": swap_database(base.database_url),
             "api_database_url": swap_database(base.api_database_url),
+            "auth_database_url": swap_database(base.auth_database_url),
+            "worker_database_url": swap_database(base.worker_database_url),
             "simulator_database_url": swap_database(base.simulator_database_url),
             "oracle_database_url": swap_database(base.oracle_database_url),
         }
@@ -61,6 +63,8 @@ def shell_exports(settings: Settings) -> str:
     values = {
         "DATABASE_URL": settings.database_url,
         "API_DATABASE_URL": settings.api_database_url,
+        "AUTH_DATABASE_URL": settings.auth_database_url,
+        "WORKER_DATABASE_URL": settings.worker_database_url,
         "SIMULATOR_DATABASE_URL": settings.simulator_database_url,
         "ORACLE_DATABASE_URL": settings.oracle_database_url,
         "SIMULATOR_BASE_URL": settings.simulator_base_url,
@@ -115,6 +119,8 @@ def migrate(settings: Settings) -> None:
         {
             "DATABASE_URL": settings.database_url,
             "API_DATABASE_URL": settings.api_database_url,
+            "AUTH_DATABASE_URL": settings.auth_database_url,
+            "WORKER_DATABASE_URL": settings.worker_database_url,
             "SIMULATOR_DATABASE_URL": settings.simulator_database_url,
             "ORACLE_DATABASE_URL": settings.oracle_database_url,
             "PYTHONPATH": str(repo_root() / "src"),
@@ -193,11 +199,13 @@ def serve_simulator() -> None:
             env = os.environ.copy()
             env.update(
                 {
-                    "DATABASE_URL": settings.database_url,
-                    "API_DATABASE_URL": settings.api_database_url,
-                    "SIMULATOR_DATABASE_URL": settings.simulator_database_url,
-                    "ORACLE_DATABASE_URL": settings.oracle_database_url,
-                    "SIMULATOR_BASE_URL": settings.simulator_base_url,
+            "DATABASE_URL": settings.database_url,
+            "API_DATABASE_URL": settings.api_database_url,
+            "AUTH_DATABASE_URL": settings.auth_database_url,
+            "WORKER_DATABASE_URL": settings.worker_database_url,
+            "SIMULATOR_DATABASE_URL": settings.simulator_database_url,
+            "ORACLE_DATABASE_URL": settings.oracle_database_url,
+            "SIMULATOR_BASE_URL": settings.simulator_base_url,
                     "SIMULATOR_TOKEN": settings.simulator_token,
                     "WEB_ORIGIN": settings.web_origin,
                     "PYTHONPATH": str(repo_root() / "src"),

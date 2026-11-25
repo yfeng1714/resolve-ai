@@ -1,4 +1,4 @@
-.PHONY: env check-setup db-up db-down migrate seed api simulator web test check
+.PHONY: env check-setup db-up db-down migrate seed api simulator worker web test check
 
 export PYTHONPATH := $(CURDIR)/src
 UV := UV_CACHE_DIR=$(CURDIR)/.uv-cache uv
@@ -29,6 +29,9 @@ api:
 
 simulator:
 	$(UV) run uvicorn resolveai.simulator.app:app --host 127.0.0.1 --port 8001 --app-dir src
+
+worker:
+	PYTHONPATH=src $(UV) run python -m resolveai.worker
 
 web:
 	$(PNPM) --dir apps/web dev

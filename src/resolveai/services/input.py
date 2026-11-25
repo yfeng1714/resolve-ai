@@ -52,6 +52,9 @@ def invalidate_pending_intent(session: Session, ticket: Ticket) -> None:
         run.state = "cancelled"
         run.error_code = "input_changed"
         run.updated_at = utcnow()
+    from resolveai.services.combined import copy_forward
+
+    copy_forward(session, ticket)
     if not cancelled_ids:
         return
     drafts = session.scalars(
