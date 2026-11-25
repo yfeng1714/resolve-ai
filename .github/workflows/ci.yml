@@ -6,7 +6,9 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Playwright 1.56.1 has no Chromium build for ubuntu-latest (26.04); keep 24.04
+    # until the pinned Playwright supports the newer image.
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: pgvector/pgvector:0.8.7-pg18-bookworm

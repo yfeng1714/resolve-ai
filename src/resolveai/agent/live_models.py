@@ -26,7 +26,7 @@ from resolveai.agent.spend import BudgetCeiling, SpendLedger
 from resolveai.clock import utcnow
 from resolveai.settings import LiveModelBlocked
 
-PROMPT_VERSION = "m2-accept-v1"
+PROMPT_VERSION = "m3-live-v1"
 REQUEST_TIMEOUT_SECONDS = 45.0
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 INSTRUCTIONS = (

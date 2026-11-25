@@ -180,3 +180,4 @@ The figure is rounded application accounting from reported usage and the configu
 - The 24 cases are the development smoke catalog. They are not a held-out ranking and not the Portfolio evaluation.
 - One prompt sentence was added after the first pass, and one catalog assertion was corrected after it rejected a safe handoff. Both changes are described above. The prompt was not fitted to a customer name, amount, or fixture id.
 - There is still one tenant, no subscription or incident flow, and no durable worker. Runs execute inside the API request.
+- M3 later added `list_subscriptions`, `propose_cancellation` and `list_incidents` to the live tool list, so the live prompt label became `m3-live-v1`. No live campaign has run under that label. The results above remain evidence for `m2-accept-v1` and its recorded source only.

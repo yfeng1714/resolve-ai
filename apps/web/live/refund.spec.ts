@@ -20,7 +20,7 @@ test("live Luna approves one refund and rejects another", async ({ page }) => {
   await expect(page.locator(".amount")).toHaveText("$42.00", { timeout: 60_000 });
   await expect(page.getByTestId("run-budget")).toContainText("openai");
   await expect(page.getByTestId("run-budget")).toContainText("gpt-6-luna");
-  await expect(page.getByTestId("run-budget")).toContainText("m2-accept-v1");
+  await expect(page.getByTestId("run-budget")).toContainText("m3-live-v1");
   await expect(page.getByTestId("policy-citation")).toContainText("Duplicate payment refunds");
   await expect(page.getByTestId("billing-evidence")).toContainText("INV-1001");
   await expect(page.getByTestId("billing-evidence")).toContainText("$42.00");
